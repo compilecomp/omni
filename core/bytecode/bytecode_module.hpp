@@ -1,0 +1,121 @@
+// core/bytecode/bytecode_module.hpp
+//
+// A compiled bytecode module — the unit of compilation and loading.
+//
+// Purpose:
+//   Implements the runtime representation of a loaded Omni module. A
+//   BytecodeModule holds the instruction stream, constant pool, symbol
+//   resolution table, function descriptors, and metadata required by
+//   the interpreter and the JIT tiers.
+//
+// Invariants:
+//   - A module is immutable once published. New versions are new modules.
+//   - The instruction stream is a flat array of Instructions.
+//   - The constant pool is a flat array of TaggedValues.
+//   - All symbols referenced by instructions are interned; the module
+//     stores SymbolId arrays for property names, method names, etc.
+//   - Loading verifies integrity (Rule 105): instruction stream length
+//     fits in MAX_BYTECODE_LENGTH, constant pool indices are in range,
+//     branch targets are within the module.
+//
+// Edge cases:
+//   - A function within a module may be entered at any pc that is a
+//     valid opcode boundary (verified at load time).
+//   - The constant pool can hold any TaggedValue; some entries are
+//     pre-resolved (e.g., interned method names) and others are
+//     resolved at runtime (e.g., global references).
+//
+// Cross-references:
+//   - LAWS.md Rule 105 (Profiles, Bytecode, and Caches Are Untrusted)
+//   - LAWS.md Rule 108 (Serialized Artifacts Must Be Verified)
+//   - LAWS.md Rule 107 (Compatibility Manifest)
+//   - DESIGN.md §4.1 (semantic bytecode)
+
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <vector>
+
+#include "core/bytecode/instruction.hpp"
+#include "core/common/result.hpp"
+#include "core/common/types.hpp"
+#include "core/object_model/tagged_value.hpp"
+
+namespace omni::bytecode {
+
+/// Function descriptor within a module.
+struct FunctionDesc {
+    common::SymbolId name;          // interned name
+    uint32_t entry_pc;              // pc of the first instruction
+    uint16_t param_count;
+    uint16_t local_count;           // including params
+    uint16_t default_count;         // number of default-arg expressions
+    uint16_t max_registers;         // peak register usage (for Tier 0)
+    bool is_async;                  // async function (has await points)
+    bool is_generator;              // generator function (has yield)
+};
+
+/// Exception handler table entry.
+struct HandlerEntry {
+    uint32_t try_start_pc;
+    uint32_t try_end_pc;            // exclusive
+    uint32_t handler_pc;
+    common::SymbolId exception_type;  // 0 = catch all
+};
+
+/// Constant pool entry. May be a primitive value, an interned symbol,
+/// or a forward reference resolved at load time.
+struct ConstEntry {
+    object_model::TaggedValue value;
+};
+
+class BytecodeModule {
+public:
+    BytecodeModule(uint32_t module_id, std::vector<Instruction>&& code)
+        : module_id_(module_id), code_(std::move(code)) {}
+
+    [[nodiscard]] uint32_t module_id() const noexcept { return module_id_; }
+    [[nodiscard]] std::span<const Instruction> code() const noexcept {
+        return {code_.data(), code_.size()};
+    }
+    [[nodiscard]] std::span<Instruction> code_mut() noexcept {
+        return {code_.data(), code_.size()};
+    }
+    [[nodiscard]] uint32_t length() const noexcept {
+        return static_cast<uint32_t>(code_.size());
+    }
+
+    /// Constant pool access.
+    [[nodiscard]] const std::vector<ConstEntry>& constants() const noexcept { return constants_; }
+    void add_constant(ConstEntry c) { constants_.push_back(c); }
+
+    /// Function table access.
+    [[nodiscard]] const std::vector<FunctionDesc>& functions() const noexcept { return functions_; }
+    void add_function(FunctionDesc f) { functions_.push_back(f); }
+
+    /// Exception handler table access.
+    [[nodiscard]] const std::vector<HandlerEntry>& handlers() const noexcept { return handlers_; }
+    void add_handler(HandlerEntry h) { handlers_.push_back(h); }
+
+    /// Look up the handler covering a given pc, or nullptr.
+    [[nodiscard]] const HandlerEntry* find_handler(uint32_t pc, common::SymbolId exc_type) const noexcept {
+        for (const auto& h : handlers_) {
+            if (pc >= h.try_start_pc && pc < h.try_end_pc) {
+                if (h.exception_type == common::NULL_SYMBOL || h.exception_type == exc_type) {
+                    return &h;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+private:
+    uint32_t module_id_;
+    std::vector<Instruction> code_;
+    std::vector<ConstEntry> constants_;
+    std::vector<FunctionDesc> functions_;
+    std::vector<HandlerEntry> handlers_;
+};
+
+}  // namespace omni::bytecode
