@@ -93,6 +93,12 @@ public:
             gc_map_clear(r);
         }
     }
+    /// Direct pointer to the register array. Used by handle_call to
+    /// pass args without copying (B2-14 fix: was allocating 4KB per call).
+    /// The pointer is valid for the lifetime of the frame.
+    [[nodiscard]] const object_model::TaggedValue* regs_data() const noexcept {
+        return regs_.data();
+    }
 
     // --- GC map (Rule 86) ---
     /// GC map is a bitmask over the register file. A bit is set when
@@ -144,6 +150,11 @@ public:
         SiteProfile& p = profiles_.back();
         p.pc = pc;
         return &p;
+    }
+    /// Read-write access to all profiles. Used by the safepoint handler
+    /// (B7 fix) to walk and invalidate stale ICs.
+    [[nodiscard]] common::SmallVector<SiteProfile, 4>& profiles() noexcept {
+        return profiles_;
     }
 
 private:

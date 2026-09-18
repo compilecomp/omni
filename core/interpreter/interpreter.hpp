@@ -95,6 +95,25 @@ public:
     /// Current frame depth (for recursion limit checks).
     [[nodiscard]] uint32_t frame_depth() const noexcept { return frame_depth_; }
 
+    /// Thread id for this interpreter. Used by sync_enter/sync_exit to
+    /// acquire/release thin locks (B2-5 fix: was hardcoded to 1).
+    /// Each Interpreter is per-thread, so this is stable.
+    [[nodiscard]] uint32_t thread_id() const noexcept { return thread_id_; }
+    void set_thread_id(uint32_t id) noexcept { thread_id_ = id; }
+
+    /// The module currently being executed by this interpreter (B1 fix:
+    /// handlers need to read the instruction at frame.pc() from the
+    /// module's code stream). Set by execute() before the dispatch loop.
+    /// Returns nullptr if no execution is in progress.
+    [[nodiscard]] const bytecode::BytecodeModule* current_module() const noexcept {
+        return current_module_;
+    }
+
+    /// Convenience: read the instruction at the given pc from the current
+    /// module. Returns Instruction{} if no module is loaded.
+    [[nodiscard]] bytecode::Instruction current_instruction(
+        common::BytecodePC pc) const noexcept;
+
     /// Bump the safepoint poll counter and return true if a safepoint
     /// poll is due (Rule 88).
     [[nodiscard]] bool poll_safepoint() noexcept {
@@ -119,6 +138,14 @@ private:
 
     uint32_t frame_depth_{0};
     uint32_t safepoint_counter_{0};
+    /// Thread id for thin-lock ownership (B2-5 fix). Defaults to 1
+    /// for single-threaded use; set by the runtime when spawning tasks.
+    uint32_t thread_id_{1};
+
+    /// Pointer to the module currently being executed. Set in execute()
+    /// before the dispatch loop begins; cleared on exit. Used by handlers
+    /// to read the current instruction (B1 fix).
+    const bytecode::BytecodeModule* current_module_{nullptr};
 
     /// Atomic flag: when set, the interpreter checks for pending
     /// invalidations at the next safepoint. Cleared after the check.

@@ -73,6 +73,9 @@ struct ClosureEnvPayload {
 struct FunctionPayload {
     /// BytecodeModule id for this function's body.
     uint32_t module_id;
+    /// Function index within the module's function table.
+    /// B2-1 fix: was missing; CALL handler hardcoded 0.
+    uint32_t function_index;
     /// Entry bytecode pc.
     uint32_t entry_pc;
     /// Parameter count and default-argument table.

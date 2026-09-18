@@ -9,7 +9,10 @@
 
 #include "core/bytecode/bytecode_verifier.hpp"
 #include "core/common/types.hpp"
+#include "core/interpreter/handlers_fused.hpp"
+#include "core/interpreter/handlers_quickened.hpp"
 #include "core/interpreter/handlers_semantic.hpp"
+#include "core/interpreter/interpreter_concurrency.hpp"
 
 namespace omni::interpreter {
 
@@ -35,6 +38,16 @@ constexpr common::SymbolId ERR_TIMEOUT = common::NULL_SYMBOL;
 
 Interpreter::Interpreter() {
     handlers_semantic::register_all(*this);
+    handlers_quickened::register_all(*this);  // B11 fix
+    handlers_fused::register_all(*this);      // B11 fix
+}
+
+bytecode::Instruction Interpreter::current_instruction(
+    common::BytecodePC pc) const noexcept {
+    if (current_module_ == nullptr) return bytecode::Instruction{};
+    const auto code = current_module_->code();
+    if (pc >= code.size()) return bytecode::Instruction{};
+    return code[pc];
 }
 
 Result<uint32_t> Interpreter::load_module(
@@ -82,6 +95,17 @@ Result<object_model::TaggedValue> Interpreter::execute(
         uint32_t& depth;
         ~FrameDepthGuard() { --depth; }
     } depth_guard{frame_depth_};
+
+    // B1 fix: expose the current module to handlers via current_module_.
+    // Save and restore the previous value so that recursive execute()
+    // calls (via CALL handler) work correctly.
+    const bytecode::BytecodeModule* prev_module = current_module_;
+    current_module_ = &module;
+    struct CurrentModuleGuard {
+        const bytecode::BytecodeModule*& slot;
+        const bytecode::BytecodeModule* prev;
+        ~CurrentModuleGuard() { slot = prev; }
+    } module_guard{current_module_, prev_module};
 
     // Load arguments into registers.
     for (uint16_t i = 0; i < fdesc.param_count; ++i) {
@@ -156,17 +180,37 @@ Result<object_model::TaggedValue> Interpreter::execute(
 }
 
 void Interpreter::handle_safepoint(InterpFrame& frame) noexcept {
-    // Check for pending invalidations (Rule 95, Rule 117).
-    if (invalidation_pending_.load(std::memory_order_acquire)) {
-        invalidation_pending_.store(false, std::memory_order_release);
-        // For each site profile, check if the shape epoch has bumped
-        // since the profile was last updated; if so, mark the IC dirty.
-        // In a real implementation this would walk the frame's profiles
-        // and dispatch to per-kind invalidation handlers.
-        (void)frame;
+    // B7 fix: real safepoint handler. Walks the frame's site profiles
+    // and invalidates any IC whose shape epoch is stale (Rule 95, 117).
+    //
+    // B2-26 fix: check the global invalidation flag (was checking a
+    // per-interpreter flag that was never set).
+    if (GlobalEpoch::is_invalidation_pending()) [[unlikely]] {
+        GlobalEpoch::clear_invalidation();
+        const common::Epoch now = GlobalEpoch::current();
+        // Walk each site profile and check whether the shape epoch has
+        // advanced since the profile was last updated. If so, mark the
+        // profile as needing re-quickening (state -> Generic) and clear
+        // the poly_entries so the next observation starts fresh.
+        for (auto& p : frame.profiles()) {
+            if (p.shape_epoch != 0 && p.shape_epoch < now) {
+                // Shape epoch advanced: invalidate this site.
+                p.shape_epoch = common::INITIAL_EPOCH;
+                p.shape_id = common::NULL_SHAPE;
+                p.shape_version = common::INITIAL_SHAPE_VERSION;
+                p.poly_entries.clear();
+                // Demote to Generic so quickening is re-evaluated.
+                if (p.state != SiteState::Disabled) {
+                    p.state = SiteState::Generic;
+                }
+            }
+        }
     }
+
     // GC safepoint: in a full implementation we would check a global
-    // GC-state flag and yield if requested.
+    // GC-state flag and yield if requested. For now, this is a no-op;
+    // the GC subsystem will be implemented in a later phase.
+    // DESIGN.md §19 (GC model) is the spec for this.
 }
 
 }  // namespace omni::interpreter

@@ -49,7 +49,20 @@ public:
         return instance().epoch_.load(std::memory_order_acquire);
     }
     static common::Epoch bump() noexcept {
+        // B2-26 fix: set the global invalidation-pending flag so that
+        // all interpreters check for stale ICs at their next safepoint.
+        instance().invalidation_pending_.store(true, std::memory_order_release);
         return instance().epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    /// Check if any shape transition has occurred since the last check.
+    /// Interpreters poll this at safepoints (Rule 88, Rule 95).
+    [[nodiscard]] static bool is_invalidation_pending() noexcept {
+        return instance().invalidation_pending_.load(std::memory_order_acquire);
+    }
+    /// Clear the invalidation flag. Called by an interpreter after it
+    /// has walked its profiles and invalidated stale ICs.
+    static void clear_invalidation() noexcept {
+        instance().invalidation_pending_.store(false, std::memory_order_release);
     }
 
 private:
@@ -59,6 +72,7 @@ private:
         return e;
     }
     std::atomic<common::Epoch> epoch_{common::INITIAL_EPOCH};
+    std::atomic<bool> invalidation_pending_{false};
 };
 
 /// Safepoint state for one thread. The runtime sets `requested` to

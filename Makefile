@@ -32,26 +32,38 @@ TEST_NAMES := \
 
 TEST_BINS := $(patsubst %,$(BUILD_DIR)/test_%,$(TEST_NAMES))
 
+# --- Integration tests ---
+INTEGRATION_NAMES := \
+	interpreter
+
+INTEGRATION_BINS := $(patsubst %,$(BUILD_DIR)/integration_test_%,$(INTEGRATION_NAMES))
+
 # --- Core sources (compiled into each test as needed) ---
 CORE_SRCS := \
 	core/bytecode/bytecode_verifier.cpp \
 	core/interpreter/adaptive_quickening.cpp \
 	core/interpreter/fusion_engine.cpp \
+	core/interpreter/handlers_fused.cpp \
+	core/interpreter/handlers_quickened.cpp \
 	core/interpreter/handlers_semantic.cpp \
 	core/interpreter/interpreter.cpp \
 	core/interpreter/speculative_arithmetic.cpp
 
 .PHONY: all check clean
 
-all: $(TEST_BINS)
+all: $(TEST_BINS) $(INTEGRATION_BINS)
 
-check: $(TEST_BINS)
-	@for t in $(TEST_BINS); do \
+check: $(TEST_BINS) $(INTEGRATION_BINS)
+	@for t in $(TEST_BINS) $(INTEGRATION_BINS); do \
 		echo "--- $$t ---"; \
 		./$$t || exit 1; \
 	done
 
 $(BUILD_DIR)/test_%: tests/unit/test_%.cpp $(CORE_SRCS) $(CORE_SRCS:.cpp=.hpp)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< $(CORE_SRCS) -o $@
+
+$(BUILD_DIR)/integration_test_%: tests/integration/test_%.cpp $(CORE_SRCS) $(CORE_SRCS:.cpp=.hpp)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< $(CORE_SRCS) -o $@
 

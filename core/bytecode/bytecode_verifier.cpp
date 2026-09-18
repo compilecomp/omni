@@ -185,9 +185,10 @@ Result<void> BytecodeVerifier::verify(const BytecodeModule& module) noexcept {
             }
         }
 
-        // LoadConst indices must be in range.
+        // LoadConst indices must be in range. The constant pool index
+        // is encoded in operand_b (0-255) for the compact form.
         if (op == Opcode::LoadConst) {
-            const uint16_t idx = inst.operand_ab();
+            const uint8_t idx = inst.operand_b();
             if (idx >= module.constants().size()) [[unlikely]] {
                 return make_error(ErrorCategory::Bytecode, ERR_CONST_INDEX_OUT_OF_RANGE);
             }
