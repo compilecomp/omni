@@ -61,19 +61,22 @@ struct BranchBias {
     uint32_t not_taken_count{0};
 
     void record_taken() noexcept {
+        // Saturating add: never wrap past UINT32_MAX (Rule 114).
         if (taken_count < UINT32_MAX) ++taken_count;
     }
     void record_not_taken() noexcept {
         if (not_taken_count < UINT32_MAX) ++not_taken_count;
     }
     [[nodiscard]] uint32_t total() const noexcept {
-        return taken_count + not_taken_count;
+        // Saturating add: never overflow past UINT32_MAX (Rule 114, B29 fix).
+        uint64_t t = uint64_t{taken_count} + uint64_t{not_taken_count};
+        return t > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(t);
     }
-    /// Bias as numerator over 1024 (fixed-point).
+    /// Bias as numerator over BIAS_RESOLUTION (fixed-point, 0..1024).
     [[nodiscard]] uint32_t bias_taken_q10() const noexcept {
         uint32_t t = total();
         if (t < common::BRANCH_BIAS_SAMPLE_MIN) return 0;
-        return static_cast<uint32_t>((uint64_t{taken_count} << 10) / t);
+        return static_cast<uint32_t>((uint64_t{taken_count} << common::BIAS_RESOLUTION_BITS) / t);
     }
 };
 
@@ -175,9 +178,12 @@ struct SiteProfile {
         return counter.load(std::memory_order_relaxed) >= common::SITE_HOT_THRESHOLD;
     }
 
-    /// Check if a site is monomorphic (only one shape observed).
+    /// Check if a site is monomorphic (exactly one shape observed).
+    /// An empty cache is NOT monomorphic (B17 fix: don't quicken
+    /// unprofiled sites — that would install GetPropMono with no
+    /// shape data, leading to a guaranteed IC miss).
     [[nodiscard]] bool is_monomorphic() const noexcept {
-        return poly_entries.size() <= common::IC_MONOMORPHIC_CAPACITY;
+        return poly_entries.size() == common::IC_MONOMORPHIC_CAPACITY;
     }
 
     /// Check if a site is polymorphic but not yet megamorphic.
@@ -187,10 +193,12 @@ struct SiteProfile {
     }
 
     /// Increment the failure counter; if it exceeds the threshold,
-    /// disable the site.
+    /// disable the site. Uses the Tier-0-specific threshold (B28 fix),
+    /// not the Tier-2 blacklist threshold.
     void record_failure() noexcept {
         uint32_t f = failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (f >= common::T2_DEOPT_BLACKLIST_THRESHOLD && state != SiteState::Disabled) {
+        if (f >= common::T0_SITE_DISABLE_FAILURE_THRESHOLD
+            && state != SiteState::Disabled) {
             state = SiteState::Disabled;
         }
     }

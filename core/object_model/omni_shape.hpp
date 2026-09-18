@@ -101,11 +101,16 @@ struct ShapeStability {
     /// Used as the T2->T3 promotion criterion (DESIGN.md tier ladder).
     [[nodiscard]] uint32_t score() const noexcept {
         // Inverse-weighted: more churn = lower score.
-        uint32_t churn = transitions_per_second_q8 + trait_injection_rate_q8
-                       + method_override_rate_q8 + field_churn_q8 + deopt_rate_q8;
-        // Saturating subtract; clamp at 0.
-        uint32_t s = churn > 1024u << 8 ? 0 : (1024u << 8) - churn;
-        return s >> 8;  // back to [0, 1024]
+        // All components are stored as Q8 (<< STABILITY_Q_SHIFT).
+        const uint32_t churn = transitions_per_second_q8
+                             + trait_injection_rate_q8
+                             + method_override_rate_q8
+                             + field_churn_q8
+                             + deopt_rate_q8;
+        // Saturating subtract: clamp at 0 if churn exceeds the full scale.
+        const uint32_t full = common::STABILITY_Q_FULL << common::STABILITY_Q_SHIFT;
+        const uint32_t s = churn > full ? 0 : full - churn;
+        return s >> common::STABILITY_Q_SHIFT;  // back to [0, 1024]
     }
 };
 

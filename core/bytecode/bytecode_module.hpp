@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -76,10 +77,29 @@ public:
         : module_id_(module_id), code_(std::move(code)) {}
 
     [[nodiscard]] uint32_t module_id() const noexcept { return module_id_; }
+    /// Read-only access to the instruction stream. The returned span is
+    /// const; quickening writes go through code_atomic_mut() (B9 fix).
     [[nodiscard]] std::span<const Instruction> code() const noexcept {
         return {code_.data(), code_.size()};
     }
-    [[nodiscard]] std::span<Instruction> code_mut() noexcept {
+    /// Atomic-write access for the quickening/fusion engine (B9 fix).
+    /// Each Instruction is read/written atomically. Readers (the
+    /// interpreter dispatch loop) must use code() and accept that they
+    /// may see either the old or new instruction at any given site;
+    /// they will never see a torn read because each Instruction is a
+    /// single atomic 32-bit load.
+    /// DESIGN.md §5.8: "quickening overlay atomically updated".
+    [[nodiscard]] std::span<std::atomic<uint32_t>> code_atomic_mut() noexcept {
+        // Reinterpret the Instruction storage as atomic uint32 words.
+        // Each Instruction is 3 bytes padded to 4; the 4th byte is
+        // unused padding. Atomic 32-bit writes are atomic on all
+        // supported platforms.
+        return {reinterpret_cast<std::atomic<uint32_t>*>(code_.data()),
+                code_.size()};
+    }
+    /// Used by the constructor only — before publication. After the
+    /// module is published, all writes go through code_atomic_mut().
+    [[nodiscard]] std::span<Instruction> code_init() noexcept {
         return {code_.data(), code_.size()};
     }
     [[nodiscard]] uint32_t length() const noexcept {

@@ -95,7 +95,8 @@ struct NativeHandlePayload {
 struct ProxyPayload {
     /// Trap table: get, set, has, delete, call, iterate, etc.
     /// Each entry is a TaggedValue (likely a ClosureRef) or null.
-    TaggedValue traps[16];
+    /// Sized by common::PROXY_TRAP_COUNT (Rule 23).
+    TaggedValue traps[common::PROXY_TRAP_COUNT];
     /// The target object, if non-null. May be null for fully-virtual
     /// proxies (every operation goes through traps).
     Object* target;

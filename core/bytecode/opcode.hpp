@@ -33,6 +33,13 @@ enum class Opcode : uint8_t {
     // === Semantic opcodes (DESIGN.md §4.1) — range [0, 127] ===
     // Values are explicitly assigned; never renumber.
     Invalid            = 0,
+    /// No-op. Used by the fusion engine to mark slots that have been
+    /// absorbed into a fused opcode earlier in the stream. The verifier
+    /// accepts Nop; the dispatcher silently skips it (advance pc by 1).
+    /// B10 fix: previously the fusion engine installed Opcode::Invalid
+    /// in subsequent slots, which the verifier rejects.
+    /// Value 50 is reserved for Nop (between SetField=49 and SemanticMax).
+    Nop                = 50,
     // Load/store
     LoadArg            = 1,
     LoadConst          = 2,

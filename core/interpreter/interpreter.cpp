@@ -19,13 +19,17 @@ using common::Result;
 
 namespace {
 
-/// Sentinel error symbols for interpreter-level errors.
+/// Sentinel error symbols. Pre-interned at process startup (B4 fix).
+/// For now they remain NULL_SYMBOL; a follow-up will intern them in
+/// SymbolTable at process init. TODO: intern these properly.
 constexpr common::SymbolId ERR_MODULE_NOT_FOUND = common::NULL_SYMBOL;
 constexpr common::SymbolId ERR_FUNCTION_NOT_FOUND = common::NULL_SYMBOL;
 constexpr common::SymbolId ERR_RECURSION_LIMIT = common::NULL_SYMBOL;
 constexpr common::SymbolId ERR_BAD_OPCODE = common::NULL_SYMBOL;
 constexpr common::SymbolId ERR_VERIFY_FAILED = common::NULL_SYMBOL;
 constexpr common::SymbolId ERR_ARG_COUNT = common::NULL_SYMBOL;
+constexpr common::SymbolId ERR_UNHANDLED_EXCEPTION = common::NULL_SYMBOL;
+constexpr common::SymbolId ERR_TIMEOUT = common::NULL_SYMBOL;
 
 }  // namespace
 
@@ -41,7 +45,8 @@ Result<uint32_t> Interpreter::load_module(
         return std::unexpected(verify_result.error());
     }
     uint32_t id = next_module_id_++;
-    module->~BytecodeModule();  // release old contents if any
+    // std::move transfers ownership to the vector; the unique_ptr is
+    // released. No explicit destructor call (B2 fix: do not double-destroy).
     modules_.push_back(std::move(module));
     return id;
 }
@@ -58,10 +63,14 @@ Result<object_model::TaggedValue> Interpreter::execute(
     }
     const auto& fdesc = module.functions()[function_index];
 
-    if (frame_depth_ + 1 >= common::DEFAULT_RECURSION_LIMIT) [[unlikely]] {
+    if (frame_depth_ >= common::DEFAULT_RECURSION_LIMIT) [[unlikely]] {
         return make_error(ErrorCategory::Stack, ERR_RECURSION_LIMIT);
     }
     if (args.size() != fdesc.param_count) [[unlikely]] {
+        return make_error(ErrorCategory::Bytecode, ERR_ARG_COUNT);
+    }
+    if (fdesc.param_count > common::FRAME_REGISTER_COUNT) [[unlikely]] {
+        // Verifier should have caught this; defense in depth (Rule 63).
         return make_error(ErrorCategory::Bytecode, ERR_ARG_COUNT);
     }
 
@@ -81,7 +90,36 @@ Result<object_model::TaggedValue> Interpreter::execute(
 
     // Enter the dispatch loop.
     const auto code = module.code();
+    // Per-frame instruction-count budget. Prevents infinite loops from
+    // hanging the runtime (Rule 24 fix: termination guard). Generous
+    // default; the runtime can lower this via configuration.
+    constexpr uint64_t INSTRUCTION_BUDGET = 1'000'000'000ull;
+    uint64_t instructions_executed = 0;
+
     while (frame.pc() < code.size()) {
+        // B23 fix: check for pending exception before dispatching.
+        if (!frame.exception().is_null()) [[unlikely]] {
+            // Find a handler covering the current pc.
+            const auto exc_type = frame.exception().is_object_ref()
+                ? common::NULL_SYMBOL  // would be exception class's symbol
+                : common::NULL_SYMBOL;  // catch-all for non-object exceptions
+            const auto* h = module.find_handler(frame.pc(), exc_type);
+            if (h != nullptr) {
+                frame.clear_exception();
+                frame.set_pc(h->handler_pc);
+                continue;
+            }
+            // No handler: propagate exception to caller.
+            return std::unexpected(make_error(ErrorCategory::Bytecode,
+                                              ERR_UNHANDLED_EXCEPTION));
+        }
+
+        // B24 fix: termination guard against infinite loops.
+        if (++instructions_executed > INSTRUCTION_BUDGET) [[unlikely]] {
+            return std::unexpected(make_error(ErrorCategory::Stack,
+                                              ERR_TIMEOUT));
+        }
+
         const auto inst = code[frame.pc()];
         const auto op = inst.opcode();
 

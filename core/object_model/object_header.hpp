@@ -90,8 +90,8 @@ public:
     /// Inflate to a monitor pointer (slow path).
     void inflate(void* monitor) noexcept {
         // Tag the low bit so the runtime distinguishes monitor pointers
-        // from thread ids.
-        raw_.store(reinterpret_cast<uint64_t>(monitor) | 1ull,
+        // from thread ids (which are always small unsigned integers).
+        raw_.store(reinterpret_cast<uint64_t>(monitor) | common::ONE_BIT,
                    std::memory_order_release);
     }
 
@@ -100,7 +100,7 @@ public:
     }
     [[nodiscard]] uint32_t owner_thread() const noexcept {
         uint64_t v = raw_.load(std::memory_order_relaxed);
-        if (v & 1ull) return 0;  // inflated
+        if (v & common::ONE_BIT) return 0;  // inflated to monitor
         return static_cast<uint32_t>(v);
     }
 

@@ -29,8 +29,9 @@ static int g_failures = 0;
     } while (0)
 
 static void test_size_invariant() {
-    CHECK(sizeof(Instruction) == 3);   // 24 bits packed as 3 bytes
-    CHECK(sizeof(InstructionExt) == 7);
+    // B9 fix: Instruction is 4 bytes (3 + 1 padding for atomicity).
+    CHECK(sizeof(Instruction) == 4);
+    CHECK(sizeof(InstructionExt) == 9);
 }
 
 static void test_opcode_accessors() {

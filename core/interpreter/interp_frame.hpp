@@ -95,12 +95,18 @@ public:
     }
 
     // --- GC map (Rule 86) ---
-    [[nodiscard]] uint64_t gc_map_low() const noexcept { return gc_map_[0]; }
-    [[nodiscard]] uint64_t gc_map_high() const noexcept { return gc_map_[1]; }
+    /// GC map is a bitmask over the register file. A bit is set when
+    /// the corresponding register holds an Object reference (Object*).
+    /// GC scans this map at safepoints to find live references.
+    [[nodiscard]] uint64_t gc_map_chunk(unsigned i) const noexcept {
+        [[assume(i < common::GC_MAP_CHUNKS)]];
+        return gc_map_[i];
+    }
     /// Returns true if register r currently holds a GC reference.
     [[nodiscard]] bool reg_holds_ref(common::RegId r) const noexcept {
-        if (r < 64) return (gc_map_[0] >> r) & 1ull;
-        return (gc_map_[1] >> (r - 64)) & 1ull;
+        const unsigned chunk = r / common::GC_MAP_BITS_PER_CHUNK;
+        const unsigned bit = r % common::GC_MAP_BITS_PER_CHUNK;
+        return (gc_map_[chunk] >> bit) & common::ONE_BIT;
     }
 
     // --- Exception state ---
@@ -142,12 +148,14 @@ public:
 
 private:
     void gc_map_set(common::RegId r) noexcept {
-        if (r < 64) gc_map_[0] |= (1ull << r);
-        else gc_map_[1] |= (1ull << (r - 64));
+        const unsigned chunk = r / common::GC_MAP_BITS_PER_CHUNK;
+        const unsigned bit = r % common::GC_MAP_BITS_PER_CHUNK;
+        gc_map_[chunk] |= (common::ONE_BIT << bit);
     }
     void gc_map_clear(common::RegId r) noexcept {
-        if (r < 64) gc_map_[0] &= ~(1ull << r);
-        else gc_map_[1] &= ~(1ull << (r - 64));
+        const unsigned chunk = r / common::GC_MAP_BITS_PER_CHUNK;
+        const unsigned bit = r % common::GC_MAP_BITS_PER_CHUNK;
+        gc_map_[chunk] &= ~(common::ONE_BIT << bit);
     }
 
     uint32_t module_id_;
@@ -160,9 +168,9 @@ private:
     /// Allocated inline for cache locality (Rule 61).
     std::array<object_model::TaggedValue, common::FRAME_REGISTER_COUNT> regs_{};
 
-    /// GC reference map. Two uint64s give 128 bits, enough for 256
-    /// registers (we only need 256 bits; one bit per register).
-    uint64_t gc_map_[2]{0, 0};
+    /// GC reference map. GC_MAP_CHUNKS uint64_t chunks, one bit per register.
+    /// Updated on every register store (Rule 86: all GC references tracked).
+    uint64_t gc_map_[common::GC_MAP_CHUNKS]{};
 
     object_model::TaggedValue exception_{};
     common::SmallVector<SyncEntry, 2> sync_stack_{};

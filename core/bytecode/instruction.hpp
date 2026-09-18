@@ -45,12 +45,15 @@
 
 namespace omni::bytecode {
 
-/// Compact 24-bit instruction, packed as 3 bytes.
+/// Compact 24-bit instruction, packed as 3 bytes plus 1 byte of padding
+/// to make it 4-byte aligned. The padding is required for atomic
+/// 32-bit access (B9 fix: the quickening overlay writes via atomic
+/// 32-bit stores, which require 4-byte alignment).
 class Instruction {
 public:
-    constexpr Instruction() : bytes_{0, 0, 0} {}
+    constexpr Instruction() : bytes_{0, 0, 0, 0} {}
     constexpr Instruction(Opcode op, uint8_t a, uint8_t b) noexcept
-        : bytes_{static_cast<uint8_t>(op), a, b} {}
+        : bytes_{static_cast<uint8_t>(op), a, b, 0} {}
 
     [[nodiscard]] constexpr Opcode opcode() const noexcept {
         return static_cast<Opcode>(bytes_[0]);
@@ -61,22 +64,45 @@ public:
     /// 16-bit immediate, formed by combining operands A and B (A is high
     /// byte, B is low byte). Used for branch targets and constant pool indices.
     [[nodiscard]] constexpr uint16_t operand_ab() const noexcept {
-        return static_cast<uint16_t>(bytes_[1]) << 8 | bytes_[2];
+        return static_cast<uint16_t>(static_cast<uint16_t>(bytes_[1])
+                                    << common::BYTE_SHIFT_1)
+             | bytes_[2];
     }
 
     void set_opcode(Opcode op) noexcept { bytes_[0] = static_cast<uint8_t>(op); }
     void set_operand_a(uint8_t a) noexcept { bytes_[1] = a; }
     void set_operand_b(uint8_t b) noexcept { bytes_[2] = b; }
 
-    /// Raw 24-bit value as a uint32_t (high byte 0).
+    /// Raw 32-bit value as a uint32_t (high byte 0). The low 24 bits
+    /// are the instruction; the high 8 bits are padding.
     [[nodiscard]] constexpr uint32_t raw() const noexcept {
-        return (uint32_t{bytes_[0]} << 16) | (uint32_t{bytes_[1]} << 8) | bytes_[2];
+        return (uint32_t{bytes_[0]} << common::BYTE_SHIFT_2)
+             | (uint32_t{bytes_[1]} << common::BYTE_SHIFT_1)
+             | bytes_[2];
+    }
+
+    /// Pack into a single uint32_t for atomic store (B9 fix).
+    [[nodiscard]] constexpr uint32_t packed() const noexcept {
+        return (uint32_t{bytes_[0]} << common::BYTE_SHIFT_2)
+             | (uint32_t{bytes_[1]} << common::BYTE_SHIFT_1)
+             | (uint32_t{bytes_[2]} << common::BYTE_SHIFT_0)
+             | (uint32_t{bytes_[3]} << common::BYTE_SHIFT_3);
+    }
+
+    /// Unpack from a uint32_t (B9 fix).
+    static constexpr Instruction from_packed(uint32_t v) noexcept {
+        Instruction i;
+        i.bytes_[0] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_2) & 0xFFu);
+        i.bytes_[1] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_1) & 0xFFu);
+        i.bytes_[2] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_0) & 0xFFu);
+        i.bytes_[3] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_3) & 0xFFu);
+        return i;
     }
 
 private:
-    uint8_t bytes_[3];
+    uint8_t bytes_[4];
 };
-static_assert(sizeof(Instruction) == 3, "Instruction must be 3 bytes (24 bits)");
+static_assert(sizeof(Instruction) == 4, "Instruction must be 4 bytes (24 bits + padding for atomicity)");
 
 /// Extended instruction (two consecutive 24-bit slots).
 /// Used for ops needing more than 16 bits of immediate (large branches,
@@ -97,9 +123,9 @@ public:
 
     /// 32-bit immediate formed from operands A:B:C:D (A is MSB).
     [[nodiscard]] constexpr uint32_t operand_32() const noexcept {
-        return (uint32_t{first_.operand_a()} << 24)
-             | (uint32_t{first_.operand_b()} << 16)
-             | (uint32_t{second_.operand_a()} << 8)
+        return (uint32_t{first_.operand_a()} << common::BYTE_SHIFT_3)
+             | (uint32_t{first_.operand_b()} << common::BYTE_SHIFT_2)
+             | (uint32_t{second_.operand_a()} << common::BYTE_SHIFT_1)
              | second_.operand_b();
     }
 
@@ -108,6 +134,6 @@ private:
     Instruction second_;
     uint8_t extra_{0};
 };
-static_assert(sizeof(InstructionExt) == 7, "InstructionExt must be 7 bytes");
+static_assert(sizeof(InstructionExt) == 9, "InstructionExt must be 9 bytes (2*4 + 1)");
 
 }  // namespace omni::bytecode

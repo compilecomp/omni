@@ -86,25 +86,17 @@ constexpr auto make_error(ErrorCategory c, SymbolId msg, SiteId site = 0) noexce
 
 }  // namespace omni::common
 
-// TRY(expr): evaluates expr, propagates the error if the result is unexpected,
-// otherwise yields the contained value. Compiles to a single conditional
-// branch on the success flag.
+// Note (B3 fix): the previous OMNI_TRY and OMNI_TRY_INPLACE macros have
+// been removed. Rule 49 forbids #define macros for control flow. Use
+// std::expected's monadic operations (and_then, transform, or_else)
+// or constexpr helpers instead.
 //
-// LAWS Rule 22: this replaces verbose `if (err)` chains.
-// LAWS Rule 49: this is the *only* allowed macro outside header guards
-// and trivial token pasting — it is a single-expression control-flow
-// primitive, not a logic macro.
-#define OMNI_TRY(var, expr)                                  \
-    auto _omni_try_result = (expr);                          \
-    if (!_omni_try_result.has_value()) [[unlikely]] {        \
-        return std::unexpected(std::move(_omni_try_result).error()); \
-    }                                                        \
-    auto var = std::move(_omni_try_result).value()
+// Example pattern:
+//   Result<int> r = compute();
+//   int v = r.value_or(0);  // if a default is acceptable
+//
+//   // Or with propagation:
+//   Result<int> r = compute();
+//   if (!r) return std::unexpected(r.error());  // single branch
+//   int v = *r;
 
-#define OMNI_TRY_INPLACE(expr)                               \
-    do {                                                     \
-        auto _omni_try_result = (expr);                      \
-        if (!_omni_try_result.has_value()) [[unlikely]] {    \
-            return std::unexpected(std::move(_omni_try_result).error()); \
-        }                                                    \
-    } while (0)

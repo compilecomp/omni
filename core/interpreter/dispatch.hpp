@@ -54,9 +54,9 @@ public:
     }
 
 private:
-    /// 256 handlers, one per possible 8-bit opcode value. Uninitialized
-    /// handlers are null; dispatch checks for null and falls back.
-    std::array<Handler, 256> handlers_{};
+    /// One handler slot per possible 8-bit opcode value.
+    /// Sized by DISPATCH_TABLE_SIZE (Rule 23).
+    std::array<Handler, common::DISPATCH_TABLE_SIZE> handlers_{};
 };
 
 }  // namespace omni::interpreter

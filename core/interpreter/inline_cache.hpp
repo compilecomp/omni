@@ -69,21 +69,23 @@ struct ICSlot {
 
     void store(common::ShapeId sid, common::ShapeVersion sv, uint16_t offset) noexcept {
         uint64_t v = uint64_t{sid}
-                   | (uint64_t{sv & 0xFFFFu} << 32)
-                   | (uint64_t{offset} << 48);
+                   | (uint64_t{static_cast<uint16_t>(sv & common::IC_SLOT_VERSION_MASK)}
+                      << common::IC_SLOT_VERSION_SHIFT)
+                   | (uint64_t{offset} << common::IC_SLOT_OFFSET_SHIFT);
         packed.store(v, std::memory_order_release);
     }
     [[nodiscard]] uint64_t load() const noexcept {
         return packed.load(std::memory_order_acquire);
     }
     [[nodiscard]] static common::ShapeId shape_id_of(uint64_t v) noexcept {
-        return static_cast<common::ShapeId>(v & 0xFFFFFFFFu);
+        return static_cast<common::ShapeId>(v & common::IC_SLOT_SHAPE_ID_MASK);
     }
     [[nodiscard]] static common::ShapeVersion version_of(uint64_t v) noexcept {
-        return static_cast<common::ShapeVersion>((v >> 32) & 0xFFFFu);
+        return static_cast<common::ShapeVersion>(
+            (v >> common::IC_SLOT_VERSION_SHIFT) & common::IC_SLOT_VERSION_MASK);
     }
     [[nodiscard]] static uint16_t offset_of(uint64_t v) noexcept {
-        return static_cast<uint16_t>(v >> 48);
+        return static_cast<uint16_t>(v >> common::IC_SLOT_OFFSET_SHIFT);
     }
     /// Returns true if the slot's shape id matches the given one.
     [[nodiscard]] bool matches(common::ShapeId sid) const noexcept {
@@ -99,19 +101,36 @@ public:
 
     /// Try a monomorphic property-access lookup. Returns the value if
     /// the cache hits; returns nullopt (ic_miss) otherwise.
+    ///
+    /// B13 fix: also validate shape_version, not just shape_id. Without
+    /// the version check, a shape that transitioned and happened to keep
+    /// the same shape_id (rare but possible after a AddField+RemoveField
+    /// sequence) would return a stale cached offset.
+    /// B14 fix: validate layout_kind() == FixedStruct before reading
+    /// fixed_struct.slots. Without this, calling this IC on a DenseArray
+    /// or Dictionary object would re-interpret an unrelated union member
+    /// as FixedStructPayload and return garbage.
     [[nodiscard]] std::optional<object_model::TaggedValue>
     try_monomorphic_property(const object_model::Object& obj,
                               common::SymbolId /*prop_name*/) const noexcept {
         const uint64_t v = slot_.load();
         if (v == 0) return std::nullopt;
-        const auto sid = ICSlot::shape_id_of(v);
+        const auto cached_sid = ICSlot::shape_id_of(v);
+        const auto cached_sver = ICSlot::version_of(v);
         const auto* shape = obj.shape();
-        if (!shape || shape->shape_id() != sid) return std::nullopt;
-        // Hit: read the slot at the cached offset.
+        if (!shape) return std::nullopt;
+        if (shape->shape_id() != cached_sid) return std::nullopt;
+        // B13 fix: also check the version. If the shape transitioned,
+        // the cached offset may point to a different field.
+        if (shape->shape_version() != cached_sver) return std::nullopt;
+        // B14 fix: only FixedStruct layout uses the slot array. Other
+        // layouts have different payload shapes and need different IC
+        // specializations.
+        if (shape->layout_kind() != object_model::LayoutKind::FixedStruct) {
+            return std::nullopt;
+        }
         const uint16_t offset = ICSlot::offset_of(v);
         const auto& pl = obj.payload;
-        // For FixedStruct: offset is a slot index. We assume FixedStruct
-        // here; the runtime checks layout_kind() before calling.
         if (offset >= pl.fixed_struct.slot_count) return std::nullopt;
         return pl.fixed_struct.slots[offset];
     }
