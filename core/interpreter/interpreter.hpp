@@ -162,6 +162,41 @@ public:
     /// by execute(), so it's valid for the duration of the call.
     [[nodiscard]] InterpFrame* current_frame() const noexcept { return current_frame_; }
 
+    /// Linked-list node for the frame stack. Each active execute() call
+    /// pushes its frame onto this stack so the GC can walk ALL frames
+    /// (not just the current one). This is critical for recursive calls:
+    /// when function A calls function B, A's registers hold live object
+    /// references that must survive GC during B's execution.
+    struct FrameNode {
+        InterpFrame* frame;
+        FrameNode* prev;
+    };
+
+    /// Push a frame onto the frame stack. Called by execute().
+    void push_frame(InterpFrame* frame, FrameNode* node) noexcept {
+        node->frame = frame;
+        node->prev = frame_stack_head_;
+        frame_stack_head_ = node;
+    }
+
+    /// Pop a frame from the frame stack. Called by execute() on exit.
+    void pop_frame() noexcept {
+        if (frame_stack_head_ != nullptr) {
+            frame_stack_head_ = frame_stack_head_->prev;
+        }
+    }
+
+    /// Walk all frames on the frame stack. The GC calls this during root
+    /// scanning. The callback receives each frame pointer.
+    template <typename Fn>
+    void walk_frames(Fn&& callback) const noexcept {
+        FrameNode* node = frame_stack_head_;
+        while (node != nullptr) {
+            callback(node->frame);
+            node = node->prev;
+        }
+    }
+
 private:
     // Single unified dispatch table covering all 256 opcode values.
     // Semantic opcodes [0,127], quickened [128,223], fused [224,255]
@@ -186,6 +221,10 @@ private:
     /// Pointer to the current frame (for GC root scanning). Set in
     /// execute() before the dispatch loop begins; cleared on exit.
     InterpFrame* current_frame_{nullptr};
+
+    /// Head of the frame stack (linked list of all active frames).
+    /// Used by the GC to walk all frames during root scanning.
+    FrameNode* frame_stack_head_{nullptr};
 
     /// Atomic flag: when set, the interpreter checks for pending
     /// invalidations at the next safepoint. Cleared after the check.

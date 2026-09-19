@@ -67,6 +67,7 @@
 #include "core/common/symbol_table.hpp"
 #include "core/common/types.hpp"
 #include "core/gc/gc.hpp"
+#include "core/gc/load_barrier.hpp"
 #include "core/interpreter/inline_cache.hpp"
 #include "core/interpreter/interpreter.hpp"
 #include "core/interpreter/interpreter_concurrency.hpp"
@@ -320,6 +321,23 @@ void handle_set_prop(InterpFrame& frame, Interpreter& interp) noexcept {
         return;
     }
     obj->payload.fixed_struct.slots[slot] = frame.load_reg(rsrc);
+
+    // Write barrier: if the stored value is an object reference, record
+    // the parent→child edge so the generational GC can find cross-gen
+    // references during minor collections (Rule 87).
+    {
+        const auto stored = frame.load_reg(rsrc);
+        if (stored.is_object_ref() || stored.is_closure_ref()) {
+            auto& gc = gc::GarbageCollector::instance();
+            Object* parent = obj;
+            Object* child = stored.as_object();
+            if (parent != nullptr && child != nullptr
+                && gc.heap_contains(parent) && gc.heap_contains(child)) {
+                gc::write_barrier(gc.ptr_to_ref(parent), gc.ptr_to_ref(child));
+            }
+        }
+    }
+
     bump_profile(frame);
     frame.advance_pc();
 }

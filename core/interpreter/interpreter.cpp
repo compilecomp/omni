@@ -60,32 +60,32 @@ Interpreter::Interpreter() {
 }
 
 void Interpreter::register_with_gc() {
-    // Register a root scanner that walks the current frame's registers.
-    // For each register holding an ObjectRef/ClosureRef, convert the
-    // Object* to a HeapRef (if it's GC-managed) and mark it.
+    // Register a root scanner that walks ALL frames on the frame stack.
+    // For each frame, walk all registers via the gc_map and mark any
+    // GC-managed object references.
     //
-    // The GC calls this at safepoints. The interpreter is stopped, so
-    // current_frame_ is valid. For recursive calls, we need to walk all
-    // frames — that's handled by the frame stack (future work; for now
-    // we walk only the current frame, which is correct for non-recursive
-    // code and conservative for recursive code).
+    // Walking all frames (not just current_frame_) is critical for
+    // recursive calls: when function A calls function B, A's registers
+    // are still live (they hold object references that will be used
+    // when B returns). The GC must scan A's frame too.
     gc::GarbageCollector::instance().register_root_scanner(
         [this](std::function<void(gc::HeapRef)> mark) {
-            if (current_frame_ == nullptr) return;
             auto& gc = gc::GarbageCollector::instance();
-            // Walk all registers. The gc_map tells us which hold refs.
-            for (unsigned r = 0; r < common::FRAME_REGISTER_COUNT; ++r) {
-                if (current_frame_->reg_holds_ref(common::RegId{static_cast<uint8_t>(r)})) {
-                    const auto val = current_frame_->load_reg(
-                        common::RegId{static_cast<uint8_t>(r)});
-                    if (val.is_object_ref() || val.is_closure_ref()) {
-                        Object* obj = val.as_object();
-                        if (obj != nullptr && gc.heap_contains(obj)) {
-                            mark(gc.ptr_to_ref(obj));
+            walk_frames([&mark, &gc](InterpFrame* frame) {
+                if (frame == nullptr) return;
+                for (unsigned r = 0; r < common::FRAME_REGISTER_COUNT; ++r) {
+                    if (frame->reg_holds_ref(common::RegId{static_cast<uint8_t>(r)})) {
+                        const auto val = frame->load_reg(
+                            common::RegId{static_cast<uint8_t>(r)});
+                        if (val.is_object_ref() || val.is_closure_ref()) {
+                            Object* obj = val.as_object();
+                            if (obj != nullptr && gc.heap_contains(obj)) {
+                                mark(gc.ptr_to_ref(obj));
+                            }
                         }
                     }
                 }
-            }
+            });
         });
 
     // Register an object scanner that walks FixedStruct slots.
@@ -172,6 +172,11 @@ Result<object_model::TaggedValue> Interpreter::execute(
     current_module_ = &module;
     InterpFrame* prev_frame = current_frame_;
     current_frame_ = &frame;
+    // Push this frame onto the frame stack so the GC can find it during
+    // root scanning (critical for recursive calls — parent frames'
+    // registers hold live object references).
+    FrameNode frame_node;
+    push_frame(&frame, &frame_node);
     struct CurrentModuleGuard {
         const bytecode::BytecodeModule*& slot;
         const bytecode::BytecodeModule* prev;
@@ -182,6 +187,10 @@ Result<object_model::TaggedValue> Interpreter::execute(
         InterpFrame* prev;
         ~CurrentFrameGuard() { slot = prev; }
     } frame_guard{current_frame_, prev_frame};
+    struct FrameStackGuard {
+        Interpreter* interp;
+        ~FrameStackGuard() { interp->pop_frame(); }
+    } stack_guard{this};
 
     // Load arguments into registers.
     for (uint16_t i = 0; i < fdesc.param_count; ++i) {

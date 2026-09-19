@@ -43,7 +43,9 @@
 #include <functional>
 #include <vector>
 
+#include "core/gc/gc_handle.hpp"
 #include "core/gc/heap_ref.hpp"
+#include "core/gc/load_barrier.hpp"
 #include "core/gc/side_metadata.hpp"
 
 namespace omni::gc {
@@ -127,6 +129,14 @@ public:
     /// Check if an allocation is raw.
     [[nodiscard]] bool is_raw(HeapRef ref) const noexcept {
         return heap_->is_raw(ref);
+    }
+
+    /// Write barrier. Called on every object reference store into a
+    /// GC-managed object's field. Records the parent→child edge in the
+    /// remembered set for generational GC (Rule 87).
+    /// Currently a no-op; the generational collector will implement it.
+    void write_barrier(HeapRef parent, HeapRef child) noexcept {
+        gc::write_barrier(parent, child);
     }
 
     /// Register a root scanner. The GC calls all registered scanners
