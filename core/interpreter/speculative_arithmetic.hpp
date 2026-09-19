@@ -56,6 +56,22 @@ spec_int_mul(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
 [[nodiscard]] common::Result<object_model::TaggedValue>
 spec_int_div(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
 
+/// Speculative float subtraction. NaN/-0.0 preserved exactly (Rule 72).
+[[nodiscard]] common::Result<object_model::TaggedValue>
+spec_float_sub(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
+
+/// Speculative float multiplication.
+[[nodiscard]] common::Result<object_model::TaggedValue>
+spec_float_mul(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
+
+/// Speculative integer modulo. Returns an error on divide-by-zero.
+[[nodiscard]] common::Result<object_model::TaggedValue>
+spec_int_mod(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
+
+/// Speculative float modulo (fmod). NaN preserved.
+[[nodiscard]] common::Result<object_model::TaggedValue>
+spec_float_mod(object_model::TaggedValue a, object_model::TaggedValue b) noexcept;
+
 /// Speculative string concatenation. Returns the concatenated string
 /// or an error if either operand is not a Str.
 [[nodiscard]] common::Result<object_model::TaggedValue>

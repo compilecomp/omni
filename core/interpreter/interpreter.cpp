@@ -9,6 +9,8 @@
 
 #include "core/bytecode/bytecode_verifier.hpp"
 #include "core/common/types.hpp"
+#include "core/interpreter/adaptive_quickening.hpp"
+#include "core/interpreter/fusion_engine.hpp"
 #include "core/interpreter/handlers_fused.hpp"
 #include "core/interpreter/handlers_quickened.hpp"
 #include "core/interpreter/handlers_semantic.hpp"
@@ -205,6 +207,28 @@ void Interpreter::handle_safepoint(InterpFrame& frame) noexcept {
                 }
             }
         }
+    }
+
+    // Adaptive quickening: walk hot profiles and rewrite the bytecode
+    // at hot, monomorphic sites to use the quickened form (DESIGN.md §5.4).
+    // This is the Tier 0 specialization machinery — it reduces dispatch
+    // overhead and type-check overhead at hot sites without invoking
+    // the higher JIT tiers.
+    //
+    // We only run the quickening pass if we have a current module (i.e.,
+    // we are inside execute()). The const_cast is safe: visit_frame uses
+    // only the atomic-write API on the module, which is thread-safe.
+    if (current_module_ != nullptr) [[likely]] {
+        AdaptiveQuickening::visit_frame(frame,
+            const_cast<bytecode::BytecodeModule&>(*current_module_), *this);
+    }
+
+    // Fusion engine: after quickening, try to fuse consecutive hot sites
+    // into superinstructions (DESIGN.md §5.7). This reduces dispatch
+    // overhead further by collapsing 2-3 instruction sequences into 1.
+    if (current_module_ != nullptr) [[likely]] {
+        FusionEngine::visit_frame(frame,
+            const_cast<bytecode::BytecodeModule&>(*current_module_), *this);
     }
 
     // GC safepoint: in a full implementation we would check a global

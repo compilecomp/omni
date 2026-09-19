@@ -140,6 +140,15 @@ public:
     [[nodiscard]] const common::SmallVector<PropertyEntry, 4>& properties() const noexcept {
         return properties_;
     }
+    /// Mutable access for the ShapeRegistry to populate during construction.
+    /// Only safe to call before the shape is published (i.e., before any
+    /// reader observes it). After publication, the shape is immutable.
+    [[nodiscard]] common::SmallVector<MethodEntry, 4>& mutable_methods() noexcept {
+        return methods_;
+    }
+    [[nodiscard]] common::SmallVector<PropertyEntry, 4>& mutable_properties() noexcept {
+        return properties_;
+    }
 
     // --- Transitions ---
     [[nodiscard]] const common::SmallVector<TransitionEdge, 2>& transitions() const noexcept {

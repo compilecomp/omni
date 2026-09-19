@@ -35,7 +35,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "core/bytecode/instruction.hpp"
@@ -130,12 +132,41 @@ public:
         return nullptr;
     }
 
+    // --- Per-pc side tables for instructions that need more than two
+    // operands. The 24-bit instruction format gives us only (opcode, a, b);
+    // for GET_PROP/SET_PROP we need a property name, and for GET_FIELD/
+    // SET_FIELD we need a slot index. These are stored in per-pc maps
+    // rather than expanding the instruction encoding (B2-4 fix
+    // acknowledged this need).
+    //
+    // These maps are populated at module-construction time (by the
+    // frontend or by hand-built test modules) and are read-only after
+    // the module is loaded. Lookups are O(1).
+
+    void set_prop_name(uint32_t pc, common::SymbolId name) {
+        prop_name_at_pc_[pc] = name;
+    }
+    [[nodiscard]] common::SymbolId prop_name_at(uint32_t pc) const noexcept {
+        auto it = prop_name_at_pc_.find(pc);
+        return it != prop_name_at_pc_.end() ? it->second : common::NULL_SYMBOL;
+    }
+
+    void set_field_slot(uint32_t pc, uint32_t slot) {
+        field_slot_at_pc_[pc] = slot;
+    }
+    [[nodiscard]] uint32_t field_slot_at(uint32_t pc) const noexcept {
+        auto it = field_slot_at_pc_.find(pc);
+        return it != field_slot_at_pc_.end() ? it->second : 0;
+    }
+
 private:
     uint32_t module_id_;
     std::vector<Instruction> code_;
     std::vector<ConstEntry> constants_;
     std::vector<FunctionDesc> functions_;
     std::vector<HandlerEntry> handlers_;
+    std::unordered_map<uint32_t, common::SymbolId> prop_name_at_pc_;
+    std::unordered_map<uint32_t, uint32_t> field_slot_at_pc_;
 };
 
 }  // namespace omni::bytecode

@@ -82,19 +82,25 @@ public:
     }
 
     /// Pack into a single uint32_t for atomic store (B9 fix).
+    /// IMPORTANT: this returns the in-memory representation of the
+    /// 4-byte Instruction, so that code_atomic_mut() — which reinterprets
+    /// the Instruction storage as atomic<uint32_t> — reads back the
+    /// correct bytes. The layout is little-endian (byte 0 in the low
+    /// bits), matching x86 and ARM little-endian (the supported hosts).
+    /// If we ever support a big-endian host, this must be adjusted.
     [[nodiscard]] constexpr uint32_t packed() const noexcept {
-        return (uint32_t{bytes_[0]} << common::BYTE_SHIFT_2)
+        return (uint32_t{bytes_[0]} << common::BYTE_SHIFT_0)
              | (uint32_t{bytes_[1]} << common::BYTE_SHIFT_1)
-             | (uint32_t{bytes_[2]} << common::BYTE_SHIFT_0)
+             | (uint32_t{bytes_[2]} << common::BYTE_SHIFT_2)
              | (uint32_t{bytes_[3]} << common::BYTE_SHIFT_3);
     }
 
-    /// Unpack from a uint32_t (B9 fix).
+    /// Unpack from a uint32_t (B9 fix). Inverse of packed().
     static constexpr Instruction from_packed(uint32_t v) noexcept {
         Instruction i;
-        i.bytes_[0] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_2) & 0xFFu);
+        i.bytes_[0] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_0) & 0xFFu);
         i.bytes_[1] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_1) & 0xFFu);
-        i.bytes_[2] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_0) & 0xFFu);
+        i.bytes_[2] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_2) & 0xFFu);
         i.bytes_[3] = static_cast<uint8_t>((v >> common::BYTE_SHIFT_3) & 0xFFu);
         return i;
     }

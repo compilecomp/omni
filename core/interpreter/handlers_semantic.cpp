@@ -58,16 +58,20 @@
 
 #include <cmath>
 #include <new>
+#include <optional>
+#include <vector>
 
 #include "core/bytecode/instruction.hpp"
 #include "core/bytecode/opcode.hpp"
 #include "core/common/result.hpp"
 #include "core/common/symbol_table.hpp"
 #include "core/common/types.hpp"
+#include "core/interpreter/inline_cache.hpp"
 #include "core/interpreter/interpreter.hpp"
 #include "core/interpreter/interpreter_concurrency.hpp"
 #include "core/interpreter/speculative_arithmetic.hpp"
 #include "core/object_model/object.hpp"
+#include "core/object_model/shape_registry.hpp"
 #include "core/object_model/tagged_value.hpp"
 
 namespace omni::interpreter {
@@ -183,9 +187,54 @@ void handle_store_local(InterpFrame& frame, Interpreter& interp) noexcept {
 
 // --- Property access ---
 
+// Helper: look up the InlineCache slot for the current pc in the frame's
+// site profile. The IC is keyed on (pc); we store the (shape_id, version,
+// offset) tuple in the SiteProfile's poly_entries[0] (monomorphic) or
+// poly_entries[1..N] (polymorphic).
+//
+// For Tier 0 we use a monomorphic IC with a single slot. Polymorphic ICs
+// (DESIGN.md §5.6) are a future-work item; for now, on a miss, we
+// overwrite the single slot with the new observation.
+[[nodiscard]] static inline std::optional<TaggedValue>
+ic_try_get_prop(InterpFrame& frame, const Object* obj,
+                 common::SymbolId /*prop_name*/) noexcept {
+    SiteProfile* p = frame.find_or_create_profile(frame.pc());
+    if (p->poly_entries.empty()) return std::nullopt;
+    const auto& entry = p->poly_entries[0];
+    const OmniShape* shape = obj->shape();
+    if (shape == nullptr) return std::nullopt;
+    if (shape->shape_id() != entry.shape_id) return std::nullopt;
+    if (shape->shape_version() != entry.shape_version) return std::nullopt;
+    // Hit: read the slot directly.
+    const uint32_t slot = entry.hit_count;  // hit_count is reused as slot index
+    if (slot >= obj->payload.fixed_struct.slot_count) return std::nullopt;
+    return obj->payload.fixed_struct.slots[slot];
+}
+
+// Helper: record a property-access observation in the IC. The slot index
+// is stored in hit_count (poly_entries uses hit_count as a slot index for
+// property-access ICs; the alternative would be a separate field, but we
+// reuse the existing struct).
+static inline void ic_record_get_prop(InterpFrame& frame,
+                                       common::ShapeId sid,
+                                       common::ShapeVersion sv,
+                                       uint32_t slot) noexcept {
+    SiteProfile* p = frame.find_or_create_profile(frame.pc());
+    if (p->poly_entries.empty()) {
+        SiteProfile::PolyEntry e{sid, sv, slot};
+        p->poly_entries.push_back(e);
+    } else {
+        // Overwrite the monomorphic slot.
+        auto& e = p->poly_entries[0];
+        e.shape_id = sid;
+        e.shape_version = sv;
+        e.hit_count = slot;
+    }
+}
+
 void handle_get_prop(InterpFrame& frame, Interpreter& interp) noexcept {
-    // GET_PROP rdst, obj_reg, prop_name_const_idx
-    // B2-19 fix: raise NotImplementedError instead of silently storing null.
+    // GET_PROP rdst, obj_reg
+    // Property name is in the module's per-pc side table.
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
     const RegId obj_reg = RegId{inst.operand_b()};
@@ -194,40 +243,90 @@ void handle_get_prop(InterpFrame& frame, Interpreter& interp) noexcept {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    // Full property lookup requires the shape registry and IC, which
-    // are not yet implemented. Raise instead of returning wrong data.
-    (void)rdst;
-    raise_not_implemented(frame);
+    Object* obj = obj_val.as_object();
+    const auto* mod = interp.current_module();
+    if (mod == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const common::SymbolId prop_name = mod->prop_name_at(frame.pc());
+    if (prop_name == common::NULL_SYMBOL) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+
+    // Try the monomorphic IC first.
+    auto cached = ic_try_get_prop(frame, obj, prop_name);
+    if (cached.has_value()) [[likely]] {
+        frame.store_reg(rdst, *cached);
+        bump_profile(frame);
+        frame.advance_pc();
+        return;
+    }
+
+    // IC miss: slow path. Look up the property in the shape's table.
+    const OmniShape* shape = obj->shape();
+    if (shape == nullptr || shape->layout_kind() != LayoutKind::FixedStruct) {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const uint32_t slot = ShapeRegistry::find_slot(*shape, prop_name);
+    if (slot == common::INVALID_PC || slot >= obj->payload.fixed_struct.slot_count) {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    // Record the IC observation.
+    ic_record_get_prop(frame, shape->shape_id(), shape->shape_version(), slot);
+    frame.store_reg(rdst, obj->payload.fixed_struct.slots[slot]);
+    bump_profile(frame);
+    frame.advance_pc();
 }
 
 void handle_set_prop(InterpFrame& frame, Interpreter& interp) noexcept {
-    // SET_PROP obj_reg, rsrc, prop_name_const_idx
-    // B2-19 fix: raise NotImplementedError instead of silently discarding.
-    (void)interp;
+    // SET_PROP obj_reg, rsrc
+    // Property name is in the module's per-pc side table.
     const Instruction inst = current_inst(frame, interp);
     const RegId obj_reg = RegId{inst.operand_a()};
+    const RegId rsrc = RegId{inst.operand_b()};
     const TaggedValue obj_val = frame.load_reg(obj_reg);
     if (!obj_val.is_object_ref()) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    raise_not_implemented(frame);
+    Object* obj = obj_val.as_object();
+    const auto* mod = interp.current_module();
+    if (mod == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const common::SymbolId prop_name = mod->prop_name_at(frame.pc());
+    if (prop_name == common::NULL_SYMBOL) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+
+    // Look up the property in the shape's table.
+    const OmniShape* shape = obj->shape();
+    if (shape == nullptr || shape->layout_kind() != LayoutKind::FixedStruct) {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const uint32_t slot = ShapeRegistry::find_slot(*shape, prop_name);
+    if (slot == common::INVALID_PC || slot >= obj->payload.fixed_struct.slot_count) {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    obj->payload.fixed_struct.slots[slot] = frame.load_reg(rsrc);
+    bump_profile(frame);
+    frame.advance_pc();
 }
 
 void handle_get_field(InterpFrame& frame, Interpreter& interp) noexcept {
-    // GET_FIELD rdst, obj_reg, slot_idx
-    // B2-4 fix: use operand_b as the slot index (was hardcoded to 0).
+    // GET_FIELD rdst, obj_reg
+    // Slot index is in the module's per-pc side table.
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
     const RegId obj_reg = RegId{inst.operand_b()};
-    // The slot index is encoded in the next instruction's operand_a
-    // (or we could use a different encoding). For the compact form,
-    // we use a convention: slot_idx = operand_b of the NEXT instruction.
-    // But since the next instruction might be a Nop (after fusion), we
-    // need a different approach. For now, we use a side-table mapping
-    // (pc, obj_reg) → slot_idx. This is a placeholder; the full
-    // implementation would use InstructionExt for 3-operand form.
-    // B2-4 fix: at minimum, bounds-check and use slot 0 only if valid.
     const TaggedValue obj_val = frame.load_reg(obj_reg);
     if (!obj_val.is_object_ref()) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
@@ -238,21 +337,24 @@ void handle_get_field(InterpFrame& frame, Interpreter& interp) noexcept {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    if (obj->payload.fixed_struct.slot_count == 0) [[unlikely]] {
+    const auto* mod = interp.current_module();
+    if (mod == nullptr) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    // B2-4 fix: read the slot index from the next instruction (Nop after
-    // fusion, or the real next instruction). For now, use slot 0 as the
-    // only safe default; the full implementation needs InstructionExt.
-    // TODO: switch to InstructionExt for 3-operand GET_FIELD.
-    frame.store_reg(rdst, obj->payload.fixed_struct.slots[0]);
+    const uint32_t slot = mod->field_slot_at(frame.pc());
+    if (slot >= obj->payload.fixed_struct.slot_count) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    frame.store_reg(rdst, obj->payload.fixed_struct.slots[slot]);
     bump_profile(frame);
     frame.advance_pc();
 }
 
 void handle_set_field(InterpFrame& frame, Interpreter& interp) noexcept {
-    // SET_FIELD obj_reg, slot_idx, rsrc
+    // SET_FIELD obj_reg, rsrc
+    // Slot index is in the module's per-pc side table.
     const Instruction inst = current_inst(frame, interp);
     const RegId obj_reg = RegId{inst.operand_a()};
     const RegId rsrc = RegId{inst.operand_b()};
@@ -266,12 +368,17 @@ void handle_set_field(InterpFrame& frame, Interpreter& interp) noexcept {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    if (obj->payload.fixed_struct.slot_count == 0) [[unlikely]] {
+    const auto* mod = interp.current_module();
+    if (mod == nullptr) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    // Simplified: slot 0.
-    obj->payload.fixed_struct.slots[0] = frame.load_reg(rsrc);
+    const uint32_t slot = mod->field_slot_at(frame.pc());
+    if (slot >= obj->payload.fixed_struct.slot_count) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    obj->payload.fixed_struct.slots[slot] = frame.load_reg(rsrc);
     bump_profile(frame);
     frame.advance_pc();
 }
@@ -301,6 +408,13 @@ void handle_add(InterpFrame& frame, Interpreter& interp) noexcept {
             auto rs = spec_str_concat(a, b);
             if (rs.has_value()) {
                 frame.store_reg(rdst, *rs);
+            } else if ((a.is_int() || a.is_float()) && (b.is_int() || b.is_float())) {
+                // Mixed int/float: promote both to float (Rule 72).
+                const double av = a.is_int() ? static_cast<double>(a.as_int())
+                                              : a.as_float();
+                const double bv = b.is_int() ? static_cast<double>(b.as_int())
+                                              : b.as_float();
+                frame.store_reg(rdst, TaggedValue::make_float(av + bv));
             } else {
                 // Cannot add; would need operator-overload dispatch.
                 frame.set_exception(TaggedValue::make_null());
@@ -325,9 +439,19 @@ void handle_sub(InterpFrame& frame, Interpreter& interp) noexcept {
     if (r.has_value()) [[likely]] {
         frame.store_reg(rdst, *r);
     } else {
-        // Float sub or operator overload would go here.
-        frame.set_exception(TaggedValue::make_null());
-        return;
+        // Try float fast path or mixed int/float promotion.
+        auto rf = spec_float_sub(a, b);
+        if (rf.has_value()) {
+            frame.store_reg(rdst, *rf);
+        } else if ((a.is_int() || a.is_float()) && (b.is_int() || b.is_float())) {
+            // Mixed int/float: promote both to float.
+            const double av = a.is_int() ? static_cast<double>(a.as_int()) : a.as_float();
+            const double bv = b.is_int() ? static_cast<double>(b.as_int()) : b.as_float();
+            frame.store_reg(rdst, TaggedValue::make_float(av - bv));
+        } else {
+            frame.set_exception(TaggedValue::make_null());
+            return;
+        }
     }
     bump_profile(frame);
     frame.advance_pc();
@@ -345,8 +469,17 @@ void handle_mul(InterpFrame& frame, Interpreter& interp) noexcept {
     if (r.has_value()) [[likely]] {
         frame.store_reg(rdst, *r);
     } else {
-        frame.set_exception(TaggedValue::make_null());
-        return;
+        auto rf = spec_float_mul(a, b);
+        if (rf.has_value()) {
+            frame.store_reg(rdst, *rf);
+        } else if ((a.is_int() || a.is_float()) && (b.is_int() || b.is_float())) {
+            const double av = a.is_int() ? static_cast<double>(a.as_int()) : a.as_float();
+            const double bv = b.is_int() ? static_cast<double>(b.as_int()) : b.as_float();
+            frame.store_reg(rdst, TaggedValue::make_float(av * bv));
+        } else {
+            frame.set_exception(TaggedValue::make_null());
+            return;
+        }
     }
     bump_profile(frame);
     frame.advance_pc();
@@ -389,26 +522,24 @@ void handle_mod(InterpFrame& frame, Interpreter& interp) noexcept {
     const RegId rsrc2 = RegId{inst.operand_b()};
     const TaggedValue a = frame.load_reg(rdst);
     const TaggedValue b = frame.load_reg(rsrc2);
-    if (a.is_int() && b.is_int()) {
-        const int64_t bv = b.as_int();
-        if (bv == 0) {
-            // Division by zero: raise.
+    record_type_feedback(frame, a);
+    record_type_feedback(frame, b);
+    auto r = spec_int_mod(a, b);
+    if (r.has_value()) {
+        frame.store_reg(rdst, *r);
+    } else {
+        // Try float fast path or mixed int/float promotion.
+        auto rf = spec_float_mod(a, b);
+        if (rf.has_value()) {
+            frame.store_reg(rdst, *rf);
+        } else if ((a.is_int() || a.is_float()) && (b.is_int() || b.is_float())) {
+            const double av = a.is_int() ? static_cast<double>(a.as_int()) : a.as_float();
+            const double bv = b.is_int() ? static_cast<double>(b.as_int()) : b.as_float();
+            frame.store_reg(rdst, TaggedValue::make_float(std::fmod(av, bv)));
+        } else {
             frame.set_exception(TaggedValue::make_null());
             return;
         }
-        // B2-6 fix: INT64_MIN % -1 is UB in C++ (SIGFPE on x86).
-        // Per Python semantics, (-2**63) % -1 == 0.
-        if (bv == -1) {
-            frame.store_reg(rdst, TaggedValue::make_int(0));
-        } else {
-            // C++ % truncates toward zero. Python uses floor division.
-            // For now, use C++ truncated semantics (TODO: confirm Omni's
-            // spec and switch to floor if needed — Rule 72).
-            frame.store_reg(rdst, TaggedValue::make_int(a.as_int() % bv));
-        }
-    } else {
-        frame.set_exception(TaggedValue::make_null());
-        return;
     }
     bump_profile(frame);
     frame.advance_pc();
@@ -430,16 +561,47 @@ void handle_eq(InterpFrame& frame, Interpreter& interp) noexcept {
     frame.advance_pc();
 }
 
+// --- Helper: numeric compare with int/float/mixed promotion ---
+// Returns the comparison result, or nullopt if the operands are not
+// numeric (caller should raise).
+[[nodiscard]] static inline std::optional<bool>
+numeric_compare(TaggedValue a, TaggedValue b,
+                 int op) noexcept {
+    // op: 0=lt, 1=gt, 2=le, 3=ge
+    if (a.is_int() && b.is_int()) {
+        const int64_t av = a.as_int();
+        const int64_t bv = b.as_int();
+        switch (op) {
+            case 0: return av < bv;
+            case 1: return av > bv;
+            case 2: return av <= bv;
+            case 3: return av >= bv;
+        }
+    }
+    if ((a.is_int() || a.is_float()) && (b.is_int() || b.is_float())) {
+        const double av = a.is_int() ? static_cast<double>(a.as_int()) : a.as_float();
+        const double bv = b.is_int() ? static_cast<double>(b.as_int()) : b.as_float();
+        switch (op) {
+            case 0: return av < bv;
+            case 1: return av > bv;
+            case 2: return av <= bv;
+            case 3: return av >= bv;
+        }
+    }
+    return std::nullopt;
+}
+
 void handle_lt(InterpFrame& frame, Interpreter& interp) noexcept {
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
     const RegId rsrc2 = RegId{inst.operand_b()};
     const TaggedValue a = frame.load_reg(rdst);
     const TaggedValue b = frame.load_reg(rsrc2);
-    if (a.is_int() && b.is_int()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_int() < b.as_int()));
-    } else if (a.is_float() && b.is_float()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_float() < b.as_float()));
+    record_type_feedback(frame, a);
+    record_type_feedback(frame, b);
+    auto r = numeric_compare(a, b, 0);
+    if (r.has_value()) {
+        frame.store_reg(rdst, TaggedValue::make_bool(*r));
     } else {
         frame.set_exception(TaggedValue::make_null());
         return;
@@ -454,10 +616,11 @@ void handle_gt(InterpFrame& frame, Interpreter& interp) noexcept {
     const RegId rsrc2 = RegId{inst.operand_b()};
     const TaggedValue a = frame.load_reg(rdst);
     const TaggedValue b = frame.load_reg(rsrc2);
-    if (a.is_int() && b.is_int()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_int() > b.as_int()));
-    } else if (a.is_float() && b.is_float()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_float() > b.as_float()));
+    record_type_feedback(frame, a);
+    record_type_feedback(frame, b);
+    auto r = numeric_compare(a, b, 1);
+    if (r.has_value()) {
+        frame.store_reg(rdst, TaggedValue::make_bool(*r));
     } else {
         frame.set_exception(TaggedValue::make_null());
         return;
@@ -472,10 +635,11 @@ void handle_le(InterpFrame& frame, Interpreter& interp) noexcept {
     const RegId rsrc2 = RegId{inst.operand_b()};
     const TaggedValue a = frame.load_reg(rdst);
     const TaggedValue b = frame.load_reg(rsrc2);
-    if (a.is_int() && b.is_int()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_int() <= b.as_int()));
-    } else if (a.is_float() && b.is_float()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_float() <= b.as_float()));
+    record_type_feedback(frame, a);
+    record_type_feedback(frame, b);
+    auto r = numeric_compare(a, b, 2);
+    if (r.has_value()) {
+        frame.store_reg(rdst, TaggedValue::make_bool(*r));
     } else {
         frame.set_exception(TaggedValue::make_null());
         return;
@@ -490,10 +654,11 @@ void handle_ge(InterpFrame& frame, Interpreter& interp) noexcept {
     const RegId rsrc2 = RegId{inst.operand_b()};
     const TaggedValue a = frame.load_reg(rdst);
     const TaggedValue b = frame.load_reg(rsrc2);
-    if (a.is_int() && b.is_int()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_int() >= b.as_int()));
-    } else if (a.is_float() && b.is_float()) {
-        frame.store_reg(rdst, TaggedValue::make_bool(a.as_float() >= b.as_float()));
+    record_type_feedback(frame, a);
+    record_type_feedback(frame, b);
+    auto r = numeric_compare(a, b, 3);
+    if (r.has_value()) {
+        frame.store_reg(rdst, TaggedValue::make_bool(*r));
     } else {
         frame.set_exception(TaggedValue::make_null());
         return;
@@ -595,30 +760,58 @@ void handle_return(InterpFrame& frame, Interpreter& interp) noexcept {
 // --- Object construction ---
 
 void handle_make_object(InterpFrame& frame, Interpreter& interp) noexcept {
-    // MAKE_OBJECT rdst, shape_id16
-    // B2-13 fix: use nothrow operator new; the throwing form would
-    // terminate the process via std::terminate (handler is noexcept).
-    // Full implementation routes through the GC's bump allocator.
-    (void)interp;
+    // MAKE_OBJECT rdst, shape_id8
+    // The shape_id8 in operand_b selects a pre-registered shape from
+    // the global ShapeRegistry. The shape's slot_count determines how
+    // many slots to allocate. All slots are initialized to null.
+    //
+    // Per Rule 61 (no allocations on hot path), MAKE_OBJECT is allowed
+    // to allocate — it is the slow path by definition. The fast path
+    // is PEA (partial escape analysis) in T2+, which elides the
+    // allocation entirely for non-escaping objects.
+    //
+    // Per Rule 86 (GC references tracked): the new Object holds a
+    // pointer to the slot array; the slot array holds TaggedValues
+    // whose object references are tracked via the slots themselves
+    // (the GC scans the slot array, not the register gc_map, for
+    // these references). The register gc_map is updated by store_reg
+    // when the new object reference is stored into rdst.
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
-    // B2-13 fix: use std::nothrow to avoid throwing in a noexcept handler.
-    Object* obj = static_cast<Object*>(::operator new(sizeof(Object),
-                                                       std::nothrow));
-    if (obj == nullptr) [[unlikely]] {
-        // Allocation failure: raise MemoryError.
+    const uint8_t shape_id8 = inst.operand_b();
+    OmniShape* shape = ShapeRegistry::instance().lookup(
+        static_cast<common::ShapeId>(shape_id8));
+    if (shape == nullptr) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
+    const uint32_t slot_count = static_cast<uint32_t>(shape->properties().size());
+    // Allocate the Object and the slot array. Use nothrow new (Rule 61).
+    Object* obj = static_cast<Object*>(::operator new(sizeof(Object),
+                                                       std::nothrow));
+    if (obj == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    TaggedValue* slots = nullptr;
+    if (slot_count > 0) {
+        slots = static_cast<TaggedValue*>(
+            ::operator new(sizeof(TaggedValue) * slot_count, std::nothrow));
+        if (slots == nullptr) [[unlikely]] {
+            ::operator delete(obj);
+            frame.set_exception(TaggedValue::make_null());
+            return;
+        }
+        // Initialize all slots to null.
+        for (uint32_t i = 0; i < slot_count; ++i) {
+            new (&slots[i]) TaggedValue{};
+        }
+    }
     new (&obj->header) ObjectHeader{};
     new (&obj->payload) Object::Payload{};
-    // Initialize as a FixedStruct with zero slots.
-    // B2-20 fix: the object has shape_ref=nullptr, which means
-    // layout_kind() defaults to FixedStruct. This is a known limitation;
-    // the full implementation would look up the shape by shape_id from
-    // the module's shape registry and store it atomically.
-    obj->payload.fixed_struct.slots = nullptr;
-    obj->payload.fixed_struct.slot_count = 0;
+    obj->header.shape_ref.store(shape, std::memory_order_release);
+    obj->payload.fixed_struct.slots = slots;
+    obj->payload.fixed_struct.slot_count = slot_count;
     frame.store_reg(rdst, TaggedValue::make_object(obj));
     bump_profile(frame);
     frame.advance_pc();
@@ -636,35 +829,120 @@ void handle_make_closure(InterpFrame& frame, Interpreter& interp) noexcept {
 }
 
 // --- Iteration ---
+//
+// We implement a minimal range iterator protocol sufficient for the
+// common `for i in 0..N` pattern. The iterator state is held in a
+// FixedStruct Object with 2 slots:
+//   slot 0: current (Int)
+//   slot 1: end (Int)
+// GetIter creates this object from an Int input (treating it as the
+// end of an exclusive range [0, end)).
+// Next advances slot 0; if slot 0 >= slot 1, sets rdst to null
+// (the convention used by the ITER_NEXT_BRANCH fused opcode to detect
+// end-of-iteration).
+
+// Pre-registered shape id for the 2-slot range iterator. Set up by
+// the runtime on first use; populated lazily.
+static std::atomic<common::ShapeId> g_range_iter_shape_id{0};
+
+[[nodiscard]] static inline common::ShapeId get_or_init_range_iter_shape() {
+    common::ShapeId id = g_range_iter_shape_id.load(std::memory_order_acquire);
+    if (id != 0) return id;
+    // Intern a shape with 2 slots: ["current", "end"].
+    auto cur = common::intern_symbol("current");
+    auto end = common::intern_symbol("end");
+    if (!cur.has_value() || !end.has_value()) return 0;
+    OmniShape* shape = object_model::ShapeRegistry::instance().intern(
+        2, std::vector<common::SymbolId>{*cur, *end});
+    id = shape->shape_id();
+    g_range_iter_shape_id.store(id, std::memory_order_release);
+    return id;
+}
 
 void handle_get_iter(InterpFrame& frame, Interpreter& interp) noexcept {
     // GET_ITER rdst, src
-    // For now: stub that copies src to rdst.
-    // Full implementation: check src's shape for ITERABLE capability;
-    // if present, invoke the iter trait; else raise TypeError.
-    (void)interp;
+    // If src is an Int, create a range iterator [0, src).
+    // Otherwise, raise (full iterator protocol not yet implemented).
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
     const RegId src = RegId{inst.operand_b()};
-    frame.store_reg(rdst, frame.load_reg(src));
+    const TaggedValue src_val = frame.load_reg(src);
+    if (!src_val.is_int()) [[unlikely]] {
+        // Full iterator protocol (Iterable trait dispatch) is future work.
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const common::ShapeId shape_id = get_or_init_range_iter_shape();
+    if (shape_id == 0) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    OmniShape* shape = object_model::ShapeRegistry::instance().lookup(shape_id);
+    if (shape == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    // Allocate the iterator object.
+    Object* obj = static_cast<Object*>(::operator new(sizeof(Object),
+                                                       std::nothrow));
+    if (obj == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    TaggedValue* slots = static_cast<TaggedValue*>(
+        ::operator new(sizeof(TaggedValue) * 2, std::nothrow));
+    if (slots == nullptr) [[unlikely]] {
+        ::operator delete(obj);
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    new (&slots[0]) TaggedValue{TaggedValue::make_int(0)};
+    new (&slots[1]) TaggedValue{src_val};
+    new (&obj->header) ObjectHeader{};
+    new (&obj->payload) Object::Payload{};
+    obj->header.shape_ref.store(shape, std::memory_order_release);
+    obj->payload.fixed_struct.slots = slots;
+    obj->payload.fixed_struct.slot_count = 2;
+    frame.store_reg(rdst, TaggedValue::make_object(obj));
     bump_profile(frame);
     frame.advance_pc();
 }
 
 void handle_next(InterpFrame& frame, Interpreter& interp) noexcept {
     // NEXT rdst, iter_reg
-    // B2-21 fix: raise NotImplementedError instead of silently returning
-    // null. The fused ITER_NEXT_BRANCH handler checks for null result to
-    // detect end-of-iteration, so we must distinguish "not implemented"
-    // from "iteration exhausted". For now, raise an exception (which
-    // the fused handler will treat as end-of-iteration — this is a
-    // known limitation until the iterator protocol is implemented).
-    (void)interp;
+    // Reads the iterator's current/end slots. If current < end, returns
+    // current and advances. Otherwise, sets rdst to null (end-of-iter).
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
-    (void)rdst;
-    // Raise to signal that iteration is not yet supported.
-    raise_not_implemented(frame);
+    const RegId iter_reg = RegId{inst.operand_b()};
+    const TaggedValue iter_val = frame.load_reg(iter_reg);
+    if (!iter_val.is_object_ref()) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    Object* obj = iter_val.as_object();
+    if (obj->layout_kind() != LayoutKind::FixedStruct
+        || obj->payload.fixed_struct.slot_count < 2) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    const TaggedValue cur = obj->payload.fixed_struct.slots[0];
+    const TaggedValue end = obj->payload.fixed_struct.slots[1];
+    if (!cur.is_int() || !end.is_int()) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    if (cur.as_int() >= end.as_int()) {
+        // End of iteration: signal with null.
+        frame.store_reg(rdst, TaggedValue::make_null());
+    } else {
+        // Return current, advance the iterator.
+        frame.store_reg(rdst, cur);
+        obj->payload.fixed_struct.slots[0] =
+            TaggedValue::make_int(cur.as_int() + 1);
+    }
+    bump_profile(frame);
+    frame.advance_pc();
 }
 
 // --- Concurrency (Rule 118: no GIL) ---

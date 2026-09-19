@@ -173,10 +173,23 @@ Result<void> BytecodeVerifier::verify(const BytecodeModule& module) noexcept {
         // Branch targets must be within the module. Branches use a signed
         // 16-bit delta so backward branches (loops) are expressible (B6 fix:
         // previously delta was unsigned and only forward branches were valid).
-        if (op == Opcode::Jump || op == Opcode::Branch) {
+        //
+        // Encoding (per handlers_semantic.cpp):
+        //   JUMP   delta16  — operand_ab is the signed 16-bit delta.
+        //   BRANCH cond_reg, delta8 — operand_a is the cond register,
+        //                             operand_b is the signed 8-bit delta.
+        // The verifier must use the correct delta width for each.
+        if (op == Opcode::Jump) {
             const uint16_t raw_delta = inst.operand_ab();
             const int16_t signed_delta = static_cast<int16_t>(raw_delta);
-            // Compute target using signed arithmetic to allow backward jumps.
+            const int64_t signed_target = static_cast<int64_t>(pc)
+                                        + static_cast<int64_t>(signed_delta);
+            if (signed_target < 0
+                || signed_target >= static_cast<int64_t>(code.size())) [[unlikely]] {
+                return make_error(ErrorCategory::Bytecode, ERR_BRANCH_OUT_OF_RANGE);
+            }
+        } else if (op == Opcode::Branch) {
+            const int8_t signed_delta = static_cast<int8_t>(inst.operand_b());
             const int64_t signed_target = static_cast<int64_t>(pc)
                                         + static_cast<int64_t>(signed_delta);
             if (signed_target < 0

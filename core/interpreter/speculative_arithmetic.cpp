@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <string>
 
 #include "core/common/symbol_table.hpp"
@@ -90,6 +91,42 @@ Result<TaggedValue> spec_int_div(TaggedValue a, TaggedValue b) noexcept {
     // INT64_MIN / -1 overflows.
     if (x == INT64_MIN && y == -1) [[unlikely]] return fallback();
     return TaggedValue::make_int(x / y);
+}
+
+Result<TaggedValue> spec_float_sub(TaggedValue a, TaggedValue b) noexcept {
+    if (!a.is_float() || !b.is_float()) [[unlikely]] return fallback();
+    // Plain float subtraction. NaN/-0.0 preserved automatically (IEEE 754).
+    return TaggedValue::make_float(a.as_float() - b.as_float());
+}
+
+Result<TaggedValue> spec_float_mul(TaggedValue a, TaggedValue b) noexcept {
+    if (!a.is_float() || !b.is_float()) [[unlikely]] return fallback();
+    return TaggedValue::make_float(a.as_float() * b.as_float());
+}
+
+Result<TaggedValue> spec_int_mod(TaggedValue a, TaggedValue b) noexcept {
+    if (!a.is_int() || !b.is_int()) [[unlikely]] return fallback();
+    const int64_t x = a.as_int();
+    const int64_t y = b.as_int();
+    if (y == 0) [[unlikely]] {
+        // Rule 72: modulo by zero raises for ints.
+        return make_error(ErrorCategory::Numeric, ERR_FALLBACK);
+    }
+    // INT64_MIN % -1 is UB in C++ (SIGFPE on x86). Per Python semantics,
+    // (-2**63) % -1 == 0.
+    if (y == -1) [[unlikely]] return TaggedValue::make_int(0);
+    // Use truncated division semantics (C++ %). The full implementation
+    // would follow Rule 72 / Omni spec for floor vs trunc; this matches
+    // CPython's int % behavior with truncated div.
+    return TaggedValue::make_int(x % y);
+}
+
+Result<TaggedValue> spec_float_mod(TaggedValue a, TaggedValue b) noexcept {
+    if (!a.is_float() || !b.is_float()) [[unlikely]] return fallback();
+    const double x = a.as_float();
+    const double y = b.as_float();
+    // CPython's float % uses fmod semantics. NaN preserved.
+    return TaggedValue::make_float(std::fmod(x, y));
 }
 
 Result<TaggedValue> spec_str_concat(TaggedValue a, TaggedValue b) noexcept {

@@ -5,18 +5,45 @@
 #include "core/bytecode/instruction.hpp"
 #include "core/bytecode/opcode.hpp"
 #include "core/common/types.hpp"
+#include "core/interpreter/interp_frame.hpp"
 
 namespace omni::interpreter {
 
 using namespace bytecode;
 using namespace common;
 
-uint32_t FusionEngine::visit_frame(InterpFrame& /*frame*/,
-                                      BytecodeModule& /*module*/,
+uint32_t FusionEngine::visit_frame(InterpFrame& frame,
+                                      BytecodeModule& module,
                                       Interpreter& /*interp*/) noexcept {
-    // B8 fix: still a stub; full implementation would walk profiles and
-    // try each fusion pattern at hot consecutive-site groups.
-    return 0;
+    uint32_t fused_count = 0;
+    // Walk every profile in the frame. For each hot profile, try each
+    // fusion pattern at profile.pc. We try patterns in order of "specificity"
+    // (more specific patterns first) so that e.g. GetPropCallMono is
+    // preferred over plain CallMono.
+    //
+    // Important: fusion must only fire on sites where the profile indicates
+    // the dataflow is stable (i.e., the site has been hot and has not
+    // deopted). We check is_hot() and state != Disabled.
+    auto& profiles = frame.profiles();
+    const size_t n = profiles.size();
+    for (size_t i = 0; i < n; ++i) {
+        SiteProfile& p = profiles[i];
+        if (p.state == SiteState::Disabled) continue;
+        if (p.state == SiteState::Fused) continue;
+        if (!p.is_hot()) continue;
+        // Try each fusion pattern at this pc. Order matters: more
+        // specific (longer) patterns first.
+        bool ok = try_fuse_iter_next_branch(module, p.pc)
+               || try_fuse_get_prop_call_mono(module, p.pc)
+               || try_fuse_get_prop_add_int_const(module, p.pc)
+               || try_fuse_load_add_store(module, p.pc);
+        if (ok) {
+            p.state = SiteState::Fused;
+            p.fusion_group = p.pc;
+            ++fused_count;
+        }
+    }
+    return fused_count;
 }
 
 bool FusionEngine::is_fusible(BytecodeModule& module, BytecodePC pc,
