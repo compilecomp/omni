@@ -60,18 +60,13 @@ Interpreter::Interpreter() {
 }
 
 void Interpreter::register_with_gc() {
-    // Register a root scanner that walks ALL frames on the frame stack.
-    // For each frame, walk all registers via the gc_map and mark any
-    // GC-managed object references.
-    //
-    // Walking all frames (not just current_frame_) is critical for
-    // recursive calls: when function A calls function B, A's registers
-    // are still live (they hold object references that will be used
-    // when B returns). The GC must scan A's frame too.
+    // Root scanner: walks ALL frames on the frame stack. For each register
+    // holding an Object*, calls evacuate(ptr) to copy nursery objects to
+    // old gen (minor GC) and mark_ref(ref) to mark old-gen objects (major GC).
     gc::GarbageCollector::instance().register_root_scanner(
-        [this](std::function<void(gc::HeapRef)> mark) {
-            auto& gc = gc::GarbageCollector::instance();
-            walk_frames([&mark, &gc](InterpFrame* frame) {
+        [this](std::function<void*(void*)> evacuate,
+               std::function<void(gc::HeapRef)> mark_ref) {
+            walk_frames([&](InterpFrame* frame) {
                 if (frame == nullptr) return;
                 for (unsigned r = 0; r < common::FRAME_REGISTER_COUNT; ++r) {
                     if (frame->reg_holds_ref(common::RegId{static_cast<uint8_t>(r)})) {
@@ -79,8 +74,23 @@ void Interpreter::register_with_gc() {
                             common::RegId{static_cast<uint8_t>(r)});
                         if (val.is_object_ref() || val.is_closure_ref()) {
                             Object* obj = val.as_object();
-                            if (obj != nullptr && gc.heap_contains(obj)) {
-                                mark(gc.ptr_to_ref(obj));
+                            if (obj != nullptr) {
+                                // Evacuate: copies nursery → old gen.
+                                Object* new_obj = static_cast<Object*>(evacuate(obj));
+                                if (new_obj != obj) {
+                                    // Object was moved — update the register.
+                                    frame->store_reg(
+                                        common::RegId{static_cast<uint8_t>(r)},
+                                        val.is_object_ref()
+                                            ? TaggedValue::make_object(new_obj)
+                                            : TaggedValue::make_closure(new_obj));
+                                    obj = new_obj;
+                                }
+                                // Mark old-gen objects (for major GC).
+                                auto& gc = gc::GarbageCollector::instance();
+                                if (gc.is_old_gen(obj)) {
+                                    mark_ref(gc.ptr_to_ref(obj));
+                                }
                             }
                         }
                     }
@@ -88,33 +98,40 @@ void Interpreter::register_with_gc() {
             });
         });
 
-    // Register an object scanner that walks FixedStruct slots.
-    // For each live object, the GC calls this to find child references.
-    // This must mark BOTH the slot array itself (a separate GC allocation)
-    // AND any object references stored in the slots.
+    // Object scanner: walks FixedStruct slots. Calls evacuate on each
+    // slot holding an Object* (copies nursery → old gen), and mark_ref
+    // on old-gen HeapRefs (for major GC).
     gc::GarbageCollector::instance().set_object_scanner(
-        [](void* obj_ptr, std::function<void(gc::HeapRef)> mark) {
+        [](void* obj_ptr,
+           std::function<void*(void*)> evacuate,
+           std::function<void(gc::HeapRef)> mark_ref) {
             auto* obj = static_cast<Object*>(obj_ptr);
             if (obj == nullptr) return;
+            if (obj->layout_kind() != LayoutKind::FixedStruct) return;
             auto& gc = gc::GarbageCollector::instance();
-            if (obj->layout_kind() == LayoutKind::FixedStruct) {
-                // Mark the slot array itself (it's a separate GC allocation
-                // reachable from the object via payload.fixed_struct.slots).
-                TaggedValue* slots = obj->payload.fixed_struct.slots;
-                if (slots != nullptr && gc.heap_contains(slots)) {
-                    mark(gc.ptr_to_ref(slots));
-                }
-                // Walk slot values for nested object refs.
-                const uint32_t slot_count = obj->payload.fixed_struct.slot_count;
-                for (uint32_t i = 0; i < slot_count; ++i) {
-                    const auto& slot = slots[i];
-                    if (slot.is_object_ref() || slot.is_closure_ref()) {
-                        Object* child = slot.as_object();
-                        if (child != nullptr && gc.heap_contains(child)) {
-                            mark(gc.ptr_to_ref(child));
+            const uint32_t slot_count = obj->payload.fixed_struct.slot_count;
+            for (uint32_t i = 0; i < slot_count; ++i) {
+                TaggedValue& slot = obj->payload.fixed_struct.slots[i];
+                if (slot.is_object_ref() || slot.is_closure_ref()) {
+                    Object* child = slot.as_object();
+                    if (child != nullptr) {
+                        Object* new_child = static_cast<Object*>(evacuate(child));
+                        if (new_child != child) {
+                            slot = slot.is_object_ref()
+                                ? TaggedValue::make_object(new_child)
+                                : TaggedValue::make_closure(new_child);
+                            child = new_child;
+                        }
+                        if (gc.is_old_gen(child)) {
+                            mark_ref(gc.ptr_to_ref(child));
                         }
                     }
                 }
+            }
+            // Mark the slot array itself if it's in old gen.
+            TaggedValue* slots = obj->payload.fixed_struct.slots;
+            if (slots != nullptr && gc.is_old_gen(slots)) {
+                mark_ref(gc.ptr_to_ref(slots));
             }
         });
 }

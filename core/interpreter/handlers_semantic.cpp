@@ -322,18 +322,15 @@ void handle_set_prop(InterpFrame& frame, Interpreter& interp) noexcept {
     }
     obj->payload.fixed_struct.slots[slot] = frame.load_reg(rsrc);
 
-    // Write barrier: if the stored value is an object reference, record
-    // the parent→child edge so the generational GC can find cross-gen
-    // references during minor collections (Rule 87).
+    // Write barrier: if the stored value is an object reference and the
+    // parent is old-gen and the child is nursery, mark the card dirty
+    // so the minor GC scans this object for nursery roots (Rule 87).
     {
         const auto stored = frame.load_reg(rsrc);
         if (stored.is_object_ref() || stored.is_closure_ref()) {
-            auto& gc = gc::GarbageCollector::instance();
-            Object* parent = obj;
             Object* child = stored.as_object();
-            if (parent != nullptr && child != nullptr
-                && gc.heap_contains(parent) && gc.heap_contains(child)) {
-                gc::write_barrier(gc.ptr_to_ref(parent), gc.ptr_to_ref(child));
+            if (child != nullptr) {
+                gc::GarbageCollector::instance().write_barrier(obj, child);
             }
         }
     }
@@ -801,38 +798,42 @@ void handle_make_object(InterpFrame& frame, Interpreter& interp) noexcept {
     }
     const uint32_t slot_count = static_cast<uint32_t>(shape->properties().size());
 
-    // Allocate the Object from the GC heap.
-    auto obj_ref = gc::GarbageCollector::instance().alloc(sizeof(Object));
-    if (obj_ref.is_null()) [[unlikely]] {
+    // Allocate the Object from the GC nursery.
+    Object* obj = static_cast<Object*>(
+        gc::GarbageCollector::instance().alloc(sizeof(Object)));
+    if (obj == nullptr) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    Object* obj = static_cast<Object*>(
-        gc::GarbageCollector::instance().resolve(obj_ref));
 
-    // Allocate the slot array from the GC heap (if needed).
-    TaggedValue* slots = nullptr;
-    if (slot_count > 0) {
-        auto slots_ref = gc::GarbageCollector::instance().alloc(
-            sizeof(TaggedValue) * slot_count);
-        if (slots_ref.is_null()) [[unlikely]] {
-            frame.set_exception(TaggedValue::make_null());
-            return;
-        }
-        // Mark as raw — the GC should mark it (it's reachable from the
-        // object) but NOT scan it (it has no Object header).
-        gc::GarbageCollector::instance().mark_raw(slots_ref);
-        slots = static_cast<TaggedValue*>(
-            gc::GarbageCollector::instance().resolve(slots_ref));
-    }
-
-    // Construct the Object in the GC-allocated memory.
+    // Construct the Object header immediately (with null slots) so the
+    // GC can safely scan it if a GC triggers during the slot allocation.
     new (&obj->header) ObjectHeader{};
     new (&obj->payload) Object::Payload{};
     obj->header.shape_ref.store(shape, std::memory_order_release);
-    obj->payload.fixed_struct.slots = slots;
-    obj->payload.fixed_struct.slot_count = slot_count;
+    obj->payload.fixed_struct.slots = nullptr;
+    obj->payload.fixed_struct.slot_count = 0;
+
+    // Root the Object by storing it in rdst BEFORE allocating the slots.
+    // This ensures the Object survives a GC triggered by the slot alloc.
     frame.store_reg(rdst, TaggedValue::make_object(obj));
+
+    // Allocate the slot array from the nursery.
+    if (slot_count > 0) {
+        TaggedValue* slots = static_cast<TaggedValue*>(
+            gc::GarbageCollector::instance().alloc(
+                sizeof(TaggedValue) * slot_count));
+        if (slots == nullptr) [[unlikely]] {
+            frame.set_exception(TaggedValue::make_null());
+            return;
+        }
+        // The GC may have run during alloc(), evacuating the Object from
+        // nursery to old gen. Re-read the Object pointer from the register
+        // (which was updated by the root scanner).
+        obj = frame.load_reg(rdst).as_object();
+        obj->payload.fixed_struct.slots = slots;
+        obj->payload.fixed_struct.slot_count = slot_count;
+    }
     bump_profile(frame);
     frame.advance_pc();
 }
@@ -902,30 +903,35 @@ void handle_get_iter(InterpFrame& frame, Interpreter& interp) noexcept {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    // Allocate the iterator object from the GC heap.
-    auto obj_ref = gc::GarbageCollector::instance().alloc(sizeof(Object));
-    if (obj_ref.is_null()) [[unlikely]] {
-        frame.set_exception(TaggedValue::make_null());
-        return;
-    }
+    // Allocate the iterator object from the nursery.
     Object* obj = static_cast<Object*>(
-        gc::GarbageCollector::instance().resolve(obj_ref));
-    auto slots_ref = gc::GarbageCollector::instance().alloc(sizeof(TaggedValue) * 2);
-    if (slots_ref.is_null()) [[unlikely]] {
+        gc::GarbageCollector::instance().alloc(sizeof(Object)));
+    if (obj == nullptr) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    gc::GarbageCollector::instance().mark_raw(slots_ref);
-    TaggedValue* slots = static_cast<TaggedValue*>(
-        gc::GarbageCollector::instance().resolve(slots_ref));
-    slots[0] = TaggedValue::make_int(0);
-    slots[1] = src_val;
+    // Construct the header immediately so GC can scan it safely.
     new (&obj->header) ObjectHeader{};
     new (&obj->payload) Object::Payload{};
     obj->header.shape_ref.store(shape, std::memory_order_release);
+    obj->payload.fixed_struct.slots = nullptr;
+    obj->payload.fixed_struct.slot_count = 0;
+    // Root the iterator before allocating slots.
+    frame.store_reg(rdst, TaggedValue::make_object(obj));
+
+    // Allocate the slot array.
+    TaggedValue* slots = static_cast<TaggedValue*>(
+        gc::GarbageCollector::instance().alloc(sizeof(TaggedValue) * 2));
+    if (slots == nullptr) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    // GC may have run during alloc — re-read obj from register.
+    obj = frame.load_reg(rdst).as_object();
+    slots[0] = TaggedValue::make_int(0);
+    slots[1] = src_val;
     obj->payload.fixed_struct.slots = slots;
     obj->payload.fixed_struct.slot_count = 2;
-    frame.store_reg(rdst, TaggedValue::make_object(obj));
     bump_profile(frame);
     frame.advance_pc();
 }
