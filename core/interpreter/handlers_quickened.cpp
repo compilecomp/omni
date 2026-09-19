@@ -41,9 +41,11 @@ namespace hs = handlers_semantic;
 namespace handlers_quickened {
 
 // --- Helper: read the current instruction ---
+// Uses the unchecked fast path — the dispatch loop guarantees pc is in
+// bounds and current_module_ is non-null.
 [[nodiscard]] static inline Instruction current_inst(const InterpFrame& frame,
                                                        const Interpreter& interp) noexcept {
-    return interp.current_instruction(frame.pc());
+    return interp.current_inst_fast(frame.pc());
 }
 
 // --- Helper: handle guard failure by demoting and re-dispatching ---

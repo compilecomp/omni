@@ -4,6 +4,7 @@
 
 #include "core/interpreter/interpreter.hpp"
 
+#include <cmath>
 #include <memory>
 #include <new>
 
@@ -15,6 +16,7 @@
 #include "core/interpreter/handlers_quickened.hpp"
 #include "core/interpreter/handlers_semantic.hpp"
 #include "core/interpreter/interpreter_concurrency.hpp"
+#include "core/interpreter/speculative_arithmetic.hpp"
 
 namespace omni::interpreter {
 
@@ -42,14 +44,6 @@ Interpreter::Interpreter() {
     handlers_semantic::register_all(*this);
     handlers_quickened::register_all(*this);  // B11 fix
     handlers_fused::register_all(*this);      // B11 fix
-}
-
-bytecode::Instruction Interpreter::current_instruction(
-    common::BytecodePC pc) const noexcept {
-    if (current_module_ == nullptr) return bytecode::Instruction{};
-    const auto code = current_module_->code();
-    if (pc >= code.size()) return bytecode::Instruction{};
-    return code[pc];
 }
 
 Result<uint32_t> Interpreter::load_module(
@@ -115,32 +109,38 @@ Result<object_model::TaggedValue> Interpreter::execute(
     }
 
     // Enter the dispatch loop.
+    //
+    // The dispatch uses a switch statement that the compiler turns into a
+    // jump table. Hot opcodes (arithmetic, load/store, branch/jump) are
+    // inlined directly into the switch cases — no function call, no
+    // call/ret overhead. Cold opcodes fall through to the default case
+    // which calls the handler function via the dispatch table.
+    //
+    // This is the same dispatch model CPython uses (switch + jump table).
+    // The previous function-pointer dispatch cost ~5-10 cycles per
+    // instruction in call/ret overhead; the inlined switch eliminates
+    // that entirely for hot opcodes.
     const auto code = module.code();
-    // Per-frame instruction-count budget. Prevents infinite loops from
-    // hanging the runtime (Rule 24 fix: termination guard). Generous
-    // default; the runtime can lower this via configuration.
     constexpr uint64_t INSTRUCTION_BUDGET = 1'000'000'000ull;
     uint64_t instructions_executed = 0;
 
     while (frame.pc() < code.size()) {
-        // B23 fix: check for pending exception before dispatching.
+        // Exception check (B23 fix).
         if (!frame.exception().is_null()) [[unlikely]] {
-            // Find a handler covering the current pc.
             const auto exc_type = frame.exception().is_object_ref()
-                ? common::NULL_SYMBOL  // would be exception class's symbol
-                : common::NULL_SYMBOL;  // catch-all for non-object exceptions
-            const auto* h = module.find_handler(frame.pc(), exc_type);
-            if (h != nullptr) {
+                ? common::NULL_SYMBOL
+                : common::NULL_SYMBOL;
+            const auto* exh = module.find_handler(frame.pc(), exc_type);
+            if (exh != nullptr) {
                 frame.clear_exception();
-                frame.set_pc(h->handler_pc);
+                frame.set_pc(exh->handler_pc);
                 continue;
             }
-            // No handler: propagate exception to caller.
             return std::unexpected(make_error(ErrorCategory::Bytecode,
                                               ERR_UNHANDLED_EXCEPTION));
         }
 
-        // B24 fix: termination guard against infinite loops.
+        // Termination guard (B24 fix).
         if (++instructions_executed > INSTRUCTION_BUDGET) [[unlikely]] {
             return std::unexpected(make_error(ErrorCategory::Stack,
                                               ERR_TIMEOUT));
@@ -149,31 +149,313 @@ Result<object_model::TaggedValue> Interpreter::execute(
         const auto inst = code[frame.pc()];
         const auto op = inst.opcode();
 
-        Handler h = nullptr;
-        if (bytecode::is_semantic(op)) [[likely]] {
-            h = semantic_dispatch_.get(op);
-        } else if (bytecode::is_quickened(op)) {
-            h = quickened_dispatch_.get(op);
-        } else if (bytecode::is_fused(op)) {
-            h = fused_dispatch_.get(op);
-        }
-        if (!h) [[unlikely]] {
-            // Fall back to the semantic opcode (Rule 96).
-            const auto fb = bytecode::fallback_for(op);
-            if (fb == bytecode::Opcode::Invalid) {
-                return make_error(ErrorCategory::Bytecode, ERR_BAD_OPCODE);
+        switch (op) {
+            // --- Load/store (hot) ---
+            case bytecode::Opcode::LoadConst: {
+                const common::RegId rdst{inst.operand_a()};
+                const uint8_t ci = inst.operand_b();
+                frame.store_reg(rdst, module.constants()[ci].value);
+                frame.advance_pc();
+                break;
             }
-            h = semantic_dispatch_.get(fb);
-            if (!h) [[unlikely]] {
-                return make_error(ErrorCategory::Bytecode, ERR_BAD_OPCODE);
+            case bytecode::Opcode::LoadLocal:
+            case bytecode::Opcode::LoadLocalFast:
+            case bytecode::Opcode::LoadArg:
+            case bytecode::Opcode::Dup: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId src{inst.operand_b()};
+                frame.store_reg(rdst, frame.load_reg(src));
+                frame.advance_pc();
+                break;
             }
-        }
+            case bytecode::Opcode::StoreLocal: {
+                const common::RegId dst{inst.operand_a()};
+                const common::RegId rsrc{inst.operand_b()};
+                frame.store_reg(dst, frame.load_reg(rsrc));
+                frame.advance_pc();
+                break;
+            }
+            case bytecode::Opcode::Pop: {
+                frame.store_reg(common::RegId{inst.operand_a()},
+                                object_model::TaggedValue::make_null());
+                frame.advance_pc();
+                break;
+            }
+            case bytecode::Opcode::Nop: {
+                frame.advance_pc();
+                break;
+            }
 
-        h(frame, *this);
+            // --- Arithmetic (hot: int fast path inlined) ---
+            case bytecode::Opcode::Add:
+            case bytecode::Opcode::AddIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                auto r = spec_int_add(a, b);
+                if (r.has_value()) [[likely]] {
+                    frame.store_reg(rdst, *r);
+                    frame.advance_pc();
+                    break;
+                }
+                // Fallback: semantic handler (float, string, mixed).
+                handlers_semantic::handle_add(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Sub:
+            case bytecode::Opcode::SubIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                auto r = spec_int_sub(a, b);
+                if (r.has_value()) [[likely]] {
+                    frame.store_reg(rdst, *r);
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_sub(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Mul:
+            case bytecode::Opcode::MulIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                auto r = spec_int_mul(a, b);
+                if (r.has_value()) [[likely]] {
+                    frame.store_reg(rdst, *r);
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_mul(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Div:
+            case bytecode::Opcode::DivIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                auto r = spec_int_div(a, b);
+                if (r.has_value()) {
+                    frame.store_reg(rdst, *r);
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_div(frame, *this);
+                break;
+            }
 
-        // Safepoint polling (Rule 88).
-        if (poll_safepoint()) [[unlikely]] {
-            handle_safepoint(frame);
+            // --- Comparison (hot: int fast path inlined) ---
+            case bytecode::Opcode::Lt:
+            case bytecode::Opcode::LtIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                if (a.is_int() && b.is_int()) [[likely]] {
+                    frame.store_reg(rdst,
+                        object_model::TaggedValue::make_bool(a.as_int() < b.as_int()));
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_lt(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Ge: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                if (a.is_int() && b.is_int()) [[likely]] {
+                    frame.store_reg(rdst,
+                        object_model::TaggedValue::make_bool(a.as_int() >= b.as_int()));
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_ge(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Gt: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                if (a.is_int() && b.is_int()) [[likely]] {
+                    frame.store_reg(rdst,
+                        object_model::TaggedValue::make_bool(a.as_int() > b.as_int()));
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_gt(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Le: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                if (a.is_int() && b.is_int()) [[likely]] {
+                    frame.store_reg(rdst,
+                        object_model::TaggedValue::make_bool(a.as_int() <= b.as_int()));
+                    frame.advance_pc();
+                    break;
+                }
+                handlers_semantic::handle_le(frame, *this);
+                break;
+            }
+            case bytecode::Opcode::Eq:
+            case bytecode::Opcode::EqIntFast: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                frame.store_reg(rdst,
+                    object_model::TaggedValue::make_bool(a.bitwise_eq(b)));
+                frame.advance_pc();
+                break;
+            }
+            case bytecode::Opcode::Ne: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId rsrc2{inst.operand_b()};
+                const auto a = frame.load_reg(rdst);
+                const auto b = frame.load_reg(rsrc2);
+                frame.store_reg(rdst,
+                    object_model::TaggedValue::make_bool(!a.bitwise_eq(b)));
+                frame.advance_pc();
+                break;
+            }
+
+            // --- Type checks (hot) ---
+            case bytecode::Opcode::IsNull: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId src{inst.operand_b()};
+                frame.store_reg(rdst,
+                    object_model::TaggedValue::make_bool(frame.load_reg(src).is_null()));
+                frame.advance_pc();
+                break;
+            }
+            case bytecode::Opcode::IsInt: {
+                const common::RegId rdst{inst.operand_a()};
+                const common::RegId src{inst.operand_b()};
+                frame.store_reg(rdst,
+                    object_model::TaggedValue::make_bool(frame.load_reg(src).is_int()));
+                frame.advance_pc();
+                break;
+            }
+
+            // --- Control flow (hot: safepoint poll on backedges only) ---
+            // Rule 88: safepoints at loop backedges, function calls,
+            // allocation sites. We poll ONLY on these opcodes, not on
+            // every instruction. For a 6-instruction loop with 1 backedge,
+            // this reduces poll overhead by 5/6.
+            case bytecode::Opcode::Jump: {
+                const int16_t delta = static_cast<int16_t>(inst.operand_ab());
+                frame.advance_pc(static_cast<uint32_t>(static_cast<int32_t>(delta)));
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
+            case bytecode::Opcode::Branch: {
+                const common::RegId cond_reg{inst.operand_a()};
+                const int8_t delta8 = static_cast<int8_t>(inst.operand_b());
+                const auto cond = frame.load_reg(cond_reg);
+                bool taken;
+                switch (cond.tag()) {
+                    case object_model::Tag::Null:   taken = false; break;
+                    case object_model::Tag::Bool:   taken = cond.as_bool(); break;
+                    case object_model::Tag::Int:    taken = cond.as_int() != 0; break;
+                    case object_model::Tag::Float: {
+                        const double f = cond.as_float();
+                        taken = (f != 0.0) || std::isnan(f);
+                        break;
+                    }
+                    default:           taken = true; break;
+                }
+                if (taken) {
+                    frame.advance_pc(static_cast<uint32_t>(static_cast<int32_t>(delta8)));
+                } else {
+                    frame.advance_pc();
+                }
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
+            case bytecode::Opcode::BranchTakenFast: {
+                const common::RegId cond_reg{inst.operand_a()};
+                const int8_t delta8 = static_cast<int8_t>(inst.operand_b());
+                const auto cond = frame.load_reg(cond_reg);
+                bool taken;
+                switch (cond.tag()) {
+                    case object_model::Tag::Null:   taken = false; break;
+                    case object_model::Tag::Bool:   taken = cond.as_bool(); break;
+                    case object_model::Tag::Int:    taken = cond.as_int() != 0; break;
+                    case object_model::Tag::Float: {
+                        const double f = cond.as_float();
+                        taken = (f != 0.0) || std::isnan(f);
+                        break;
+                    }
+                    default:           taken = true; break;
+                }
+                if (taken) [[likely]] {
+                    frame.advance_pc(static_cast<uint32_t>(static_cast<int32_t>(delta8)));
+                } else {
+                    frame.advance_pc();
+                }
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
+            case bytecode::Opcode::BranchNotTakenFast: {
+                const common::RegId cond_reg{inst.operand_a()};
+                const int8_t delta8 = static_cast<int8_t>(inst.operand_b());
+                const auto cond = frame.load_reg(cond_reg);
+                bool taken;
+                switch (cond.tag()) {
+                    case object_model::Tag::Null:   taken = false; break;
+                    case object_model::Tag::Bool:   taken = cond.as_bool(); break;
+                    case object_model::Tag::Int:    taken = cond.as_int() != 0; break;
+                    case object_model::Tag::Float: {
+                        const double f = cond.as_float();
+                        taken = (f != 0.0) || std::isnan(f);
+                        break;
+                    }
+                    default:           taken = true; break;
+                }
+                if (!taken) [[likely]] {
+                    frame.advance_pc();
+                } else {
+                    frame.advance_pc(static_cast<uint32_t>(static_cast<int32_t>(delta8)));
+                }
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
+            case bytecode::Opcode::Return: {
+                const common::RegId rsrc{inst.operand_a()};
+                frame.store_reg(common::RegId{0}, frame.load_reg(rsrc));
+                frame.set_pc(static_cast<common::BytecodePC>(code.size()));
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
+
+            // --- Cold opcodes: fall back to function pointer dispatch ---
+            default: {
+                Handler h = dispatch_.get(op);
+                if (!h) [[unlikely]] {
+                    const auto fb = bytecode::fallback_for(op);
+                    if (fb == bytecode::Opcode::Invalid) {
+                        return make_error(ErrorCategory::Bytecode, ERR_BAD_OPCODE);
+                    }
+                    h = dispatch_.get(fb);
+                    if (!h) [[unlikely]] {
+                        return make_error(ErrorCategory::Bytecode, ERR_BAD_OPCODE);
+                    }
+                }
+                h(frame, *this);
+                // Cold opcodes may include Call/Spawn/etc — poll for safety.
+                if (poll_safepoint()) [[unlikely]] handle_safepoint(frame);
+                break;
+            }
         }
     }
 

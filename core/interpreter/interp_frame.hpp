@@ -139,16 +139,30 @@ public:
 
     // --- Site profiles ---
     /// Lookup the SiteProfile for the current pc, creating one if missing.
-    /// Hot path: O(N) linear scan is acceptable because the per-frame
-    /// profile count is small (typically < 100). For larger frames we
-    /// would switch to a robin_map (Rule 17).
+    /// Uses a single-entry cache keyed on pc — since bump_profile,
+    /// record_type_feedback, and the IC lookup are all called for the
+    /// SAME pc within a single handler invocation, the cache hit rate
+    /// is ~100% on the hot path. This eliminates the O(N) linear scan
+    /// that was the dominant per-instruction overhead before this cache.
     [[nodiscard]] SiteProfile* find_or_create_profile(common::BytecodePC pc) {
-        for (auto& p : profiles_) {
-            if (p.pc == pc) return &p;
+        // Cache check: O(1). The cache stores the INDEX (not pointer)
+        // into profiles_, so it survives SmallVector reallocations.
+        if (pc == cached_profile_pc_
+            && cached_profile_idx_ < profiles_.size()) {
+            return &profiles_[cached_profile_idx_];
+        }
+        for (uint32_t i = 0; i < profiles_.size(); ++i) {
+            if (profiles_[i].pc == pc) {
+                cached_profile_pc_ = pc;
+                cached_profile_idx_ = i;
+                return &profiles_[i];
+            }
         }
         profiles_.push_back(SiteProfile{});
         SiteProfile& p = profiles_.back();
         p.pc = pc;
+        cached_profile_pc_ = pc;
+        cached_profile_idx_ = static_cast<uint32_t>(profiles_.size() - 1);
         return &p;
     }
     /// Read-write access to all profiles. Used by the safepoint handler
@@ -190,6 +204,11 @@ private:
     /// Site profiles. Lazily populated as the interpreter executes.
     /// For hot functions, this vector grows; for cold ones it stays empty.
     common::SmallVector<SiteProfile, 4> profiles_{};
+
+    /// Single-entry profile cache. Keyed on pc; stores the index into
+    /// profiles_ (not a pointer, to survive SmallVector reallocations).
+    common::BytecodePC cached_profile_pc_{common::INVALID_PC};
+    uint32_t cached_profile_idx_{0};
 };
 
 }  // namespace omni::interpreter

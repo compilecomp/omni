@@ -53,6 +53,8 @@
 #include "core/interpreter/interp_frame.hpp"
 #include "core/object_model/tagged_value.hpp"
 
+#include <cstring>
+
 namespace omni::interpreter {
 
 class Interpreter {
@@ -73,23 +75,20 @@ public:
 
     /// Register a handler for an opcode in the semantic dispatch table.
     void register_handler(bytecode::Opcode op, Handler h) noexcept {
-        semantic_dispatch_.set(op, h);
+        dispatch_.set(op, h);
     }
     void register_quickened_handler(bytecode::Opcode op, Handler h) noexcept {
-        quickened_dispatch_.set(op, h);
+        dispatch_.set(op, h);
     }
     void register_fused_handler(bytecode::Opcode op, Handler h) noexcept {
-        fused_dispatch_.set(op, h);
+        dispatch_.set(op, h);
     }
 
-    [[nodiscard]] const DispatchTable& semantic_dispatch() const noexcept {
-        return semantic_dispatch_;
+    [[nodiscard]] const DispatchTable& dispatch() const noexcept {
+        return dispatch_;
     }
-    [[nodiscard]] const DispatchTable& quickened_dispatch() const noexcept {
-        return quickened_dispatch_;
-    }
-    [[nodiscard]] const DispatchTable& fused_dispatch() const noexcept {
-        return fused_dispatch_;
+    [[nodiscard]] Handler handler_for(bytecode::Opcode op) const noexcept {
+        return dispatch_.get(op);
     }
 
     /// Current frame depth (for recursion limit checks).
@@ -111,8 +110,29 @@ public:
 
     /// Convenience: read the instruction at the given pc from the current
     /// module. Returns Instruction{} if no module is loaded.
+    /// This is INLINE so handlers don't pay a function-call penalty per
+    /// instruction (the hot path). The dispatch loop already guarantees
+    /// pc is in bounds, so the unchecked version below is preferred.
     [[nodiscard]] bytecode::Instruction current_instruction(
-        common::BytecodePC pc) const noexcept;
+        common::BytecodePC pc) const noexcept {
+        if (current_module_ == nullptr) [[unlikely]] return bytecode::Instruction{};
+        const auto code = current_module_->code();
+        if (pc >= code.size()) [[unlikely]] return bytecode::Instruction{};
+        return code[pc];
+    }
+
+    /// Unchecked fast path: the dispatch loop guarantees pc is in bounds
+    /// and current_module_ is non-null. Use this from handlers.
+    [[nodiscard]] bytecode::Instruction current_inst_fast(
+        common::BytecodePC pc) const noexcept {
+        return current_module_->code()[pc];
+    }
+
+    /// Direct pointer to the current module's code data. Avoids
+    /// re-constructing a span on every instruction.
+    [[nodiscard]] const bytecode::Instruction* code_data() const noexcept {
+        return current_module_ ? current_module_->code().data() : nullptr;
+    }
 
     /// Bump the safepoint poll counter and return true if a safepoint
     /// poll is due (Rule 88).
@@ -129,9 +149,11 @@ public:
     void handle_safepoint(InterpFrame& frame) noexcept;
 
 private:
-    DispatchTable semantic_dispatch_{};
-    DispatchTable quickened_dispatch_{};
-    DispatchTable fused_dispatch_{};
+    // Single unified dispatch table covering all 256 opcode values.
+    // Semantic opcodes [0,127], quickened [128,223], fused [224,255]
+    // share one table so the dispatch loop does a single array lookup
+    // instead of a branch chain + lookup.
+    DispatchTable dispatch_{};
 
     std::vector<std::unique_ptr<bytecode::BytecodeModule>> modules_;
     uint32_t next_module_id_{1};

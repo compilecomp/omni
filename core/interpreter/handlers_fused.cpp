@@ -35,7 +35,7 @@ namespace handlers_fused {
 
 [[nodiscard]] static inline Instruction current_inst(const InterpFrame& frame,
                                                        const Interpreter& interp) noexcept {
-    return interp.current_instruction(frame.pc());
+    return interp.current_inst_fast(frame.pc());
 }
 
 void handle_add_int_rr(InterpFrame& frame, Interpreter& interp) noexcept {
