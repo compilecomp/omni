@@ -14,7 +14,7 @@
 # remain here as variables.
 
 CXX      ?= g++
-CXXSTD   := -std=c++26
+CXXSTD   := -std=gnu++26
 WARN     := -Wall -Wextra -Wpedantic -Werror
 OPT      ?= -O2
 DEBUG    ?= -g
