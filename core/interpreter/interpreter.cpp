@@ -18,6 +18,8 @@
 
 #include "core/bytecode/bytecode_verifier.hpp"
 #include "core/common/types.hpp"
+#include "core/gc/gc.hpp"
+#include "core/gc/gc_handle.hpp"
 #include "core/interpreter/adaptive_quickening.hpp"
 #include "core/interpreter/fusion_engine.hpp"
 #include "core/interpreter/handlers_fused.hpp"
@@ -25,12 +27,14 @@
 #include "core/interpreter/handlers_semantic.hpp"
 #include "core/interpreter/interpreter_concurrency.hpp"
 #include "core/interpreter/speculative_arithmetic.hpp"
+#include "core/object_model/object.hpp"
 
 namespace omni::interpreter {
 
 using common::ErrorCategory;
 using common::make_error;
 using common::Result;
+using namespace omni::object_model;
 
 namespace {
 
@@ -57,23 +61,61 @@ Interpreter::Interpreter() {
 
 void Interpreter::register_with_gc() {
     // Register a root scanner that walks the current frame's registers.
-    // The GC calls this during the mark phase. We capture `this` because
-    // the interpreter is per-thread and the GC runs at a safepoint (the
-    // interpreter is stopped, so `this` is valid).
+    // For each register holding an ObjectRef/ClosureRef, convert the
+    // Object* to a HeapRef (if it's GC-managed) and mark it.
     //
-    // NOTE: This root scanner is a placeholder. The current interpreter
-    // stores raw Object* pointers in registers, not HeapRefs. Once
-    // TaggedValue is migrated to store HeapRef (per the 32-bit OmniGC
-    // spec), this scanner will convert HeapRef -> mark(ref) directly.
-    // For now, the GC operates on its own heap (separate from the
-    // interpreter's raw-new objects). Full integration is a follow-up.
+    // The GC calls this at safepoints. The interpreter is stopped, so
+    // current_frame_ is valid. For recursive calls, we need to walk all
+    // frames — that's handled by the frame stack (future work; for now
+    // we walk only the current frame, which is correct for non-recursive
+    // code and conservative for recursive code).
     gc::GarbageCollector::instance().register_root_scanner(
         [this](std::function<void(gc::HeapRef)> mark) {
             if (current_frame_ == nullptr) return;
-            // Walk all registers. The gc_map tells us which registers
-            // hold object references (Rule 86). Once objects are
-            // GC-allocated, we'll resolve Object* -> HeapRef here.
-            (void)mark;  // placeholder — no GC-managed objects yet
+            auto& gc = gc::GarbageCollector::instance();
+            // Walk all registers. The gc_map tells us which hold refs.
+            for (unsigned r = 0; r < common::FRAME_REGISTER_COUNT; ++r) {
+                if (current_frame_->reg_holds_ref(common::RegId{static_cast<uint8_t>(r)})) {
+                    const auto val = current_frame_->load_reg(
+                        common::RegId{static_cast<uint8_t>(r)});
+                    if (val.is_object_ref() || val.is_closure_ref()) {
+                        Object* obj = val.as_object();
+                        if (obj != nullptr && gc.heap_contains(obj)) {
+                            mark(gc.ptr_to_ref(obj));
+                        }
+                    }
+                }
+            }
+        });
+
+    // Register an object scanner that walks FixedStruct slots.
+    // For each live object, the GC calls this to find child references.
+    // This must mark BOTH the slot array itself (a separate GC allocation)
+    // AND any object references stored in the slots.
+    gc::GarbageCollector::instance().set_object_scanner(
+        [](void* obj_ptr, std::function<void(gc::HeapRef)> mark) {
+            auto* obj = static_cast<Object*>(obj_ptr);
+            if (obj == nullptr) return;
+            auto& gc = gc::GarbageCollector::instance();
+            if (obj->layout_kind() == LayoutKind::FixedStruct) {
+                // Mark the slot array itself (it's a separate GC allocation
+                // reachable from the object via payload.fixed_struct.slots).
+                TaggedValue* slots = obj->payload.fixed_struct.slots;
+                if (slots != nullptr && gc.heap_contains(slots)) {
+                    mark(gc.ptr_to_ref(slots));
+                }
+                // Walk slot values for nested object refs.
+                const uint32_t slot_count = obj->payload.fixed_struct.slot_count;
+                for (uint32_t i = 0; i < slot_count; ++i) {
+                    const auto& slot = slots[i];
+                    if (slot.is_object_ref() || slot.is_closure_ref()) {
+                        Object* child = slot.as_object();
+                        if (child != nullptr && gc.heap_contains(child)) {
+                            mark(gc.ptr_to_ref(child));
+                        }
+                    }
+                }
+            }
         });
 }
 

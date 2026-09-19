@@ -55,7 +55,7 @@ HeapRef Heap::alloc(size_t size_bytes) noexcept {
     uint32_t cur = free_list_head_;
     while (cur != 0) {
         const uint32_t cur_raw = read_size_header(cur);
-        const uint32_t cur_total = cur_raw & ~FREE_FLAG;
+        const uint32_t cur_total = cur_raw & SIZE_MASK;
         const uint32_t cur_data = cur_total - 1;
         if (cur_data >= data_slots) {
             // Found a fit. If the block is much larger, split it.
@@ -64,7 +64,7 @@ HeapRef Heap::alloc(size_t size_bytes) noexcept {
                 // create a new free block from the remainder.
                 const uint32_t remaining = cur_total - total_slots;
                 const uint32_t new_free_slot = cur + total_slots;
-                write_size_header(new_free_slot, remaining | FREE_FLAG);
+                write_size_header(new_free_slot, remaining | FREE_FLAG | (cur_raw & RAW_FLAG));
                 const uint32_t next = read_free_next(cur + 1);
                 write_free_next(new_free_slot + 1, next);
                 if (prev_free == 0) {
@@ -72,8 +72,8 @@ HeapRef Heap::alloc(size_t size_bytes) noexcept {
                 } else {
                     write_free_next(prev_free + 1, new_free_slot);
                 }
-                // Clear the free flag for the reused block.
-                write_size_header(cur, total_slots);
+                // Clear the free flag for the reused block (preserve RAW).
+                write_size_header(cur, total_slots | (cur_raw & RAW_FLAG));
             } else {
                 // Use the whole block (no split). Clear the free flag.
                 const uint32_t next = read_free_next(cur + 1);
@@ -82,7 +82,7 @@ HeapRef Heap::alloc(size_t size_bytes) noexcept {
                 } else {
                     write_free_next(prev_free + 1, next);
                 }
-                write_size_header(cur, cur_total);
+                write_size_header(cur, cur_total | (cur_raw & RAW_FLAG));
             }
             // Zero the user data.
             uint8_t* data = base_ + (cur + 1) * 8;
@@ -112,11 +112,11 @@ void Heap::free(HeapRef ref) noexcept {
     const uint32_t data_slot = ref.offset();
     const uint32_t header_slot = data_slot - 1;
     const uint32_t total_raw = read_size_header(header_slot);
-    const uint32_t total_slots = total_raw & ~FREE_FLAG;
+    const uint32_t total_slots = total_raw & SIZE_MASK;
     const uint32_t data_slots = total_slots - 1;
     allocated_bytes_ -= static_cast<size_t>(data_slots) * 8;
-    // Mark the block as free and add to the head of the free list.
-    write_size_header(header_slot, total_slots | FREE_FLAG);
+    // Mark the block as free (preserve RAW flag) and add to free list.
+    write_size_header(header_slot, total_slots | FREE_FLAG | (total_raw & RAW_FLAG));
     write_free_next(data_slot, free_list_head_);
     free_list_head_ = header_slot;
 }
@@ -125,7 +125,7 @@ size_t Heap::object_size(HeapRef ref) const noexcept {
     if (ref.is_null()) return 0;
     const uint32_t header_slot = ref.offset() - 1;
     if (header_slot >= static_cast<uint32_t>((bump_ptr_ - base_) / 8)) return 0;
-    const uint32_t total_slots = read_size_header(header_slot);
+    const uint32_t total_slots = read_size_header(header_slot) & SIZE_MASK;
     return static_cast<size_t>(total_slots - 1) * 8;
 }
 

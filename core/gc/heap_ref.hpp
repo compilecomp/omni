@@ -119,32 +119,30 @@ public:
     [[nodiscard]] size_t allocated() const noexcept { return allocated_bytes_; }
 
     /// Walk every live (non-free) object in the heap in allocation order.
-    /// The callback receives (ref, user_size_bytes) for each object.
-    /// Free blocks are skipped (identified by the FREE flag in the size
-    /// header). Used by the GC sweeper.
+    /// The callback receives (ref, user_size_bytes, is_raw) for each block.
+    /// Free blocks are skipped. Used by the GC sweeper.
     template <typename Fn>
     void walk_objects(Fn&& callback) const noexcept {
         uint32_t slot = 1;  // skip null slot at 0
         const uint32_t end_slot = static_cast<uint32_t>((bump_ptr_ - base_) / 8);
         while (slot < end_slot) {
-            const uint32_t total_slots = read_size_header(slot);
-            if (total_slots == 0) {
+            const uint32_t raw_header = read_size_header(slot);
+            const uint32_t actual_slots = raw_header & SIZE_MASK;
+            if (actual_slots == 0) {
                 break;  // shouldn't happen
             }
-            // High bit of the size header marks the block as free.
-            const bool is_free = (total_slots & FREE_FLAG) != 0;
-            const uint32_t actual_slots = total_slots & ~FREE_FLAG;
+            const bool is_free = (raw_header & FREE_FLAG) != 0;
+            const bool is_raw = (raw_header & RAW_FLAG) != 0;
             if (!is_free) {
                 const HeapRef ref{slot + 1};
                 const size_t user_bytes = static_cast<size_t>(actual_slots - 1) * 8;
-                callback(ref, user_bytes);
+                callback(ref, user_bytes, is_raw);
             }
             slot += actual_slots;
         }
     }
 
-    /// Check if the block at `ref` is free (used by the GC to skip
-    /// freed blocks during root scanning and object scanning).
+    /// Check if the block at `ref` is free.
     [[nodiscard]] bool is_free(HeapRef ref) const noexcept {
         if (ref.is_null()) return false;
         const uint32_t header_slot = ref.offset() - 1;
@@ -152,9 +150,32 @@ public:
         return (total & FREE_FLAG) != 0;
     }
 
+    /// Mark the block at `ref` as raw (not an Object — don't scan).
+    void mark_raw(HeapRef ref) noexcept {
+        if (ref.is_null()) return;
+        const uint32_t header_slot = ref.offset() - 1;
+        uint32_t* p = reinterpret_cast<uint32_t*>(base_ + header_slot * 8);
+        *p |= RAW_FLAG;
+    }
+
+    /// Check if the block at `ref` is raw (not an Object).
+    [[nodiscard]] bool is_raw(HeapRef ref) const noexcept {
+        if (ref.is_null()) return false;
+        const uint32_t header_slot = ref.offset() - 1;
+        const uint32_t total = read_size_header(header_slot);
+        return (total & RAW_FLAG) != 0;
+    }
+
 private:
-    // High bit of the size header marks the block as free.
+    // High bits of the size header are flags.
+    // Bit 31: FREE — block is on the free list.
+    // Bit 30: RAW  — block is raw memory (e.g., a slot array), not an
+    //               Object. The GC marks it but doesn't call the object
+    //               scanner on it.
     static constexpr uint32_t FREE_FLAG = 0x80000000u;
+    static constexpr uint32_t RAW_FLAG  = 0x40000000u;
+    static constexpr uint32_t FLAGS_MASK = FREE_FLAG | RAW_FLAG;
+    static constexpr uint32_t SIZE_MASK = ~FLAGS_MASK;
 
     void write_size_header(uint32_t header_slot, uint32_t total_slots) noexcept {
         uint32_t* p = reinterpret_cast<uint32_t*>(base_ + header_slot * 8);

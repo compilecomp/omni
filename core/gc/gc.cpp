@@ -100,13 +100,18 @@ void GarbageCollector::mark(HeapRef ref) {
 
 void GarbageCollector::scan_object(void* obj_ptr) {
     if (obj_ptr == nullptr) return;
-    if (!object_scanner_) return;
 
-    // Convert back to HeapRef for the color update.
+    // Convert to HeapRef for the color update.
     HeapRef ref = HeapRef::from_ptr(obj_ptr, heap_->base());
 
     // Mark this object as Black (fully scanned).
     metadata_->set_color(ref, GcColor::Black);
+
+    // Don't scan raw allocations (slot arrays, etc.) — they have no
+    // Object header and can't be interpreted by the object scanner.
+    if (heap_->is_raw(ref)) return;
+
+    if (!object_scanner_) return;
 
     // Scan the object's fields via the registered scanner.
     object_scanner_(obj_ptr, [this](HeapRef child) {
@@ -118,7 +123,7 @@ void GarbageCollector::sweep_phase() {
     // Walk every object in the heap. Free objects that are still White
     // (unmarked = dead). Live objects (Black) are kept; their color is
     // reset to White in reset_phase().
-    heap_->walk_objects([this](HeapRef ref, size_t /*user_size*/) {
+    heap_->walk_objects([this](HeapRef ref, size_t /*user_size*/, bool /*is_raw*/) {
         GcColor color = metadata_->get_color(ref);
         if (color == GcColor::White) {
             // Dead object — reclaim it.

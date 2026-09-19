@@ -66,6 +66,7 @@
 #include "core/common/result.hpp"
 #include "core/common/symbol_table.hpp"
 #include "core/common/types.hpp"
+#include "core/gc/gc.hpp"
 #include "core/interpreter/inline_cache.hpp"
 #include "core/interpreter/interpreter.hpp"
 #include "core/interpreter/interpreter_concurrency.hpp"
@@ -763,21 +764,14 @@ void handle_return(InterpFrame& frame, Interpreter& interp) noexcept {
 
 void handle_make_object(InterpFrame& frame, Interpreter& interp) noexcept {
     // MAKE_OBJECT rdst, shape_id8
-    // The shape_id8 in operand_b selects a pre-registered shape from
-    // the global ShapeRegistry. The shape's slot_count determines how
-    // many slots to allocate. All slots are initialized to null.
+    // Allocates a new Object from the GC heap. The Object struct is
+    // placement-new'd into the GC-allocated memory. The slot array is
+    // also GC-allocated so the GC can reclaim it when the object dies.
     //
-    // Per Rule 61 (no allocations on hot path), MAKE_OBJECT is allowed
-    // to allocate — it is the slow path by definition. The fast path
-    // is PEA (partial escape analysis) in T2+, which elides the
-    // allocation entirely for non-escaping objects.
-    //
-    // Per Rule 86 (GC references tracked): the new Object holds a
-    // pointer to the slot array; the slot array holds TaggedValues
-    // whose object references are tracked via the slots themselves
-    // (the GC scans the slot array, not the register gc_map, for
-    // these references). The register gc_map is updated by store_reg
-    // when the new object reference is stored into rdst.
+    // Per Rule 86: the register gc_map is updated by store_reg when
+    // the new object reference is stored into rdst.
+    // Per Rule 61: MAKE_OBJECT is allowed to allocate — it is the slow
+    // path by definition. The fast path is PEA in T2+.
     const Instruction inst = current_inst(frame, interp);
     const RegId rdst = RegId{inst.operand_a()};
     const uint8_t shape_id8 = inst.operand_b();
@@ -788,27 +782,33 @@ void handle_make_object(InterpFrame& frame, Interpreter& interp) noexcept {
         return;
     }
     const uint32_t slot_count = static_cast<uint32_t>(shape->properties().size());
-    // Allocate the Object and the slot array. Use nothrow new (Rule 61).
-    Object* obj = static_cast<Object*>(::operator new(sizeof(Object),
-                                                       std::nothrow));
-    if (obj == nullptr) [[unlikely]] {
+
+    // Allocate the Object from the GC heap.
+    auto obj_ref = gc::GarbageCollector::instance().alloc(sizeof(Object));
+    if (obj_ref.is_null()) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
+    Object* obj = static_cast<Object*>(
+        gc::GarbageCollector::instance().resolve(obj_ref));
+
+    // Allocate the slot array from the GC heap (if needed).
     TaggedValue* slots = nullptr;
     if (slot_count > 0) {
-        slots = static_cast<TaggedValue*>(
-            ::operator new(sizeof(TaggedValue) * slot_count, std::nothrow));
-        if (slots == nullptr) [[unlikely]] {
-            ::operator delete(obj);
+        auto slots_ref = gc::GarbageCollector::instance().alloc(
+            sizeof(TaggedValue) * slot_count);
+        if (slots_ref.is_null()) [[unlikely]] {
             frame.set_exception(TaggedValue::make_null());
             return;
         }
-        // Initialize all slots to null.
-        for (uint32_t i = 0; i < slot_count; ++i) {
-            new (&slots[i]) TaggedValue{};
-        }
+        // Mark as raw — the GC should mark it (it's reachable from the
+        // object) but NOT scan it (it has no Object header).
+        gc::GarbageCollector::instance().mark_raw(slots_ref);
+        slots = static_cast<TaggedValue*>(
+            gc::GarbageCollector::instance().resolve(slots_ref));
     }
+
+    // Construct the Object in the GC-allocated memory.
     new (&obj->header) ObjectHeader{};
     new (&obj->payload) Object::Payload{};
     obj->header.shape_ref.store(shape, std::memory_order_release);
@@ -884,22 +884,24 @@ void handle_get_iter(InterpFrame& frame, Interpreter& interp) noexcept {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
-    // Allocate the iterator object.
-    Object* obj = static_cast<Object*>(::operator new(sizeof(Object),
-                                                       std::nothrow));
-    if (obj == nullptr) [[unlikely]] {
+    // Allocate the iterator object from the GC heap.
+    auto obj_ref = gc::GarbageCollector::instance().alloc(sizeof(Object));
+    if (obj_ref.is_null()) [[unlikely]] {
         frame.set_exception(TaggedValue::make_null());
         return;
     }
+    Object* obj = static_cast<Object*>(
+        gc::GarbageCollector::instance().resolve(obj_ref));
+    auto slots_ref = gc::GarbageCollector::instance().alloc(sizeof(TaggedValue) * 2);
+    if (slots_ref.is_null()) [[unlikely]] {
+        frame.set_exception(TaggedValue::make_null());
+        return;
+    }
+    gc::GarbageCollector::instance().mark_raw(slots_ref);
     TaggedValue* slots = static_cast<TaggedValue*>(
-        ::operator new(sizeof(TaggedValue) * 2, std::nothrow));
-    if (slots == nullptr) [[unlikely]] {
-        ::operator delete(obj);
-        frame.set_exception(TaggedValue::make_null());
-        return;
-    }
-    new (&slots[0]) TaggedValue{TaggedValue::make_int(0)};
-    new (&slots[1]) TaggedValue{src_val};
+        gc::GarbageCollector::instance().resolve(slots_ref));
+    slots[0] = TaggedValue::make_int(0);
+    slots[1] = src_val;
     new (&obj->header) ObjectHeader{};
     new (&obj->payload) Object::Payload{};
     obj->header.shape_ref.store(shape, std::memory_order_release);

@@ -101,6 +101,34 @@ public:
         return heap_->resolve(ref);
     }
 
+    /// Check if a raw pointer is within the GC heap's address range.
+    /// Used by the root scanner to distinguish GC-managed objects from
+    /// raw-new objects (which are not GC-collected).
+    [[nodiscard]] bool heap_contains(void* ptr) const noexcept {
+        if (heap_ == nullptr) return false;
+        const auto addr = reinterpret_cast<uintptr_t>(ptr);
+        const auto base = heap_->base();
+        return addr >= base && addr < base + heap_->capacity();
+    }
+
+    /// Convert a raw pointer to a HeapRef. The pointer must be within
+    /// the GC heap (call heap_contains first).
+    [[nodiscard]] HeapRef ptr_to_ref(void* ptr) const noexcept {
+        return HeapRef::from_ptr(ptr, heap_->base());
+    }
+
+    /// Mark an allocation as raw (not an Object — the GC should mark it
+    /// but not call the object scanner on it). Used for slot arrays and
+    /// other non-Object allocations.
+    void mark_raw(HeapRef ref) noexcept {
+        heap_->mark_raw(ref);
+    }
+
+    /// Check if an allocation is raw.
+    [[nodiscard]] bool is_raw(HeapRef ref) const noexcept {
+        return heap_->is_raw(ref);
+    }
+
     /// Register a root scanner. The GC calls all registered scanners
     /// during the mark phase. Each interpreter should register its
     /// scanner on creation and unregister on destruction.

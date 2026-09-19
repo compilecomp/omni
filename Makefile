@@ -38,7 +38,8 @@ TEST_BINS := $(patsubst %,$(BUILD_DIR)/test_%,$(TEST_NAMES))
 # --- Integration tests ---
 INTEGRATION_NAMES := \
 	interpreter \
-	specialization
+	specialization \
+	gc_integration
 
 INTEGRATION_BINS := $(patsubst %,$(BUILD_DIR)/integration_test_%,$(INTEGRATION_NAMES))
 
