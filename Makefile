@@ -28,7 +28,8 @@ BUILD_DIR := build
 TEST_NAMES := \
 	tagged_value \
 	instruction \
-	speculative_arithmetic
+	speculative_arithmetic \
+	heap_ref
 
 TEST_BINS := $(patsubst %,$(BUILD_DIR)/test_%,$(TEST_NAMES))
 
@@ -48,7 +49,8 @@ CORE_SRCS := \
 	core/interpreter/handlers_quickened.cpp \
 	core/interpreter/handlers_semantic.cpp \
 	core/interpreter/interpreter.cpp \
-	core/interpreter/speculative_arithmetic.cpp
+	core/interpreter/speculative_arithmetic.cpp \
+	core/gc/heap_ref.cpp
 
 .PHONY: all check clean
 
