@@ -30,7 +30,8 @@ TEST_NAMES := \
 	instruction \
 	speculative_arithmetic \
 	heap_ref \
-	gc
+	gc \
+	compact_header
 
 TEST_BINS := $(patsubst %,$(BUILD_DIR)/test_%,$(TEST_NAMES))
 
