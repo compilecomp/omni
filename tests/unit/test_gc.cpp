@@ -159,6 +159,73 @@ static void test_gc_oom_triggers_gc() {
     CHECK(GarbageCollector::instance().collection_count() > 0);
 }
 
+// Test 8: Sweep actually reclaims memory. After GC, allocated bytes
+// should drop because dead objects are freed and their slots become
+// available for reuse.
+static void test_gc_sweep_reclaims() {
+    GarbageCollector::instance().init({.initial_heap_size = 64 * 1024});
+    GarbageCollector::instance().clear_root_scanners();
+    // Clear all handles from previous tests so they don't act as roots.
+    HandleTable::instance().free_scope(0);  // free global scope handles
+    GarbageCollector::instance().set_object_scanner(
+        [](void*, std::function<void(HeapRef)>) {});
+
+    // First, collect to clean up any leftover objects from prior tests.
+    GarbageCollector::instance().collect();
+
+    // Allocate 100 objects with no roots (all garbage).
+    for (int i = 0; i < 100; ++i) {
+        (void)GarbageCollector::instance().alloc(128);
+    }
+    const size_t before = GarbageCollector::instance().heap_allocated();
+    CHECK(before > 0);
+
+    // Collect — all 100 objects should be freed.
+    GarbageCollector::instance().collect();
+    const size_t after = GarbageCollector::instance().heap_allocated();
+    // After GC with no roots, allocated should be 0 (all garbage freed).
+    CHECK(after == 0);
+
+    // Verify we can allocate again (free list is populated).
+    HeapRef r = GarbageCollector::instance().alloc(128);
+    CHECK(!r.is_null());
+}
+
+// Test 9: Free list reuse — after GC frees objects, new allocations
+// should come from the free list (not bump pointer).
+static void test_gc_free_list_reuse() {
+    GarbageCollector::instance().init({.initial_heap_size = 64 * 1024});
+    GarbageCollector::instance().clear_root_scanners();
+    HandleTable::instance().free_scope(0);
+    GarbageCollector::instance().set_object_scanner(
+        [](void*, std::function<void(HeapRef)>) {});
+
+    // Clean up prior state.
+    GarbageCollector::instance().collect();
+
+    // Allocate 10 objects, record their offsets.
+    std::vector<uint32_t> offsets;
+    for (int i = 0; i < 10; ++i) {
+        HeapRef r = GarbageCollector::instance().alloc(64);
+        CHECK(!r.is_null());
+        offsets.push_back(r.offset());
+    }
+    const size_t before = GarbageCollector::instance().heap_allocated();
+
+    // GC frees all 10 (no roots).
+    GarbageCollector::instance().collect();
+    CHECK(GarbageCollector::instance().heap_allocated() == 0);
+
+    // Allocate 10 more — should reuse the freed slots.
+    for (int i = 0; i < 10; ++i) {
+        HeapRef r = GarbageCollector::instance().alloc(64);
+        CHECK(!r.is_null());
+    }
+    // Allocated should be back to the same level.
+    const size_t after = GarbageCollector::instance().heap_allocated();
+    CHECK(after == before);
+}
+
 int main() {
     test_gc_alloc();
     test_gc_alloc_no_overlap();
@@ -167,8 +234,10 @@ int main() {
     test_gc_collect_empty();
     test_gc_with_roots();
     test_gc_oom_triggers_gc();
+    test_gc_sweep_reclaims();
+    test_gc_free_list_reuse();
     if (g_failures == 0) {
-        std::printf("OK: gc (%d tests passed)\n", 7);
+        std::printf("OK: gc (%d tests passed)\n", 9);
         return 0;
     }
     std::fprintf(stderr, "FAILED: %d checks failed\n", g_failures);

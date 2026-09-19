@@ -115,22 +115,16 @@ void GarbageCollector::scan_object(void* obj_ptr) {
 }
 
 void GarbageCollector::sweep_phase() {
-    // In a bump-pointer heap, we can't actually free individual objects
-    // (there's no free list). The sweep phase in a mark-sweep collector
-    // with a bump allocator is a no-op — we just log the statistics.
-    //
-    // A real implementation would either:
-    //   (a) Use a free list (mark-sweep with free list), or
-    //   (b) Compact the heap (mark-compact), or
-    //   (c) Use a copying collector (semispace).
-    //
-    // For now, we just count live vs dead for statistics. The heap will
-    // grow until OOM, at which point we'd need to implement one of the
-    // above. This is the minimum viable GC — it correctly identifies
-    // live objects but doesn't reclaim memory yet.
-    //
-    // The next phase will add a free list for sweep to reclaim dead objects.
-    (void)0;  // no-op
+    // Walk every object in the heap. Free objects that are still White
+    // (unmarked = dead). Live objects (Black) are kept; their color is
+    // reset to White in reset_phase().
+    heap_->walk_objects([this](HeapRef ref, size_t /*user_size*/) {
+        GcColor color = metadata_->get_color(ref);
+        if (color == GcColor::White) {
+            // Dead object — reclaim it.
+            heap_->free(ref);
+        }
+    });
 }
 
 void GarbageCollector::reset_phase() {

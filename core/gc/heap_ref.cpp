@@ -1,6 +1,7 @@
 // core/gc/heap_ref.cpp
 //
-// Heap implementation — bump-pointer allocation.
+// Heap implementation — hybrid bump-pointer + free-list allocator with
+// size headers for GC sweeping.
 
 #include "core/gc/heap_ref.hpp"
 
@@ -12,7 +13,6 @@ namespace omni::gc {
 
 namespace {
 
-/// Round up `size` to the next multiple of `align`.
 constexpr size_t round_up(size_t size, size_t align) noexcept {
     return (size + align - 1) & ~(align - 1);
 }
@@ -21,8 +21,6 @@ constexpr size_t round_up(size_t size, size_t align) noexcept {
 
 Heap::Heap(size_t capacity_bytes)
     : capacity_(round_up(capacity_bytes, 8)) {
-    // Use mmap for large allocations (avoids page faults on first access
-    // and gives us huge-page alignment for free).
     void* p = ::mmap(nullptr, capacity_,
                      PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -34,18 +32,12 @@ Heap::Heap(size_t capacity_bytes)
     } else {
         base_ = static_cast<uint8_t*>(p);
     }
-    // Reserve offset 0 as the null sentinel (HeapRef(0) is null).
-    // The first real allocation starts at offset 1 (byte 8).
+    // Slot 0 is reserved (null sentinel). Bump pointer starts at slot 1.
     bump_ptr_ = base_ + 8;
     end_ = base_ + capacity_;
 }
 
 Heap::~Heap() {
-    // Determine if base_ was allocated with mmap or malloc.
-    // Heuristic: mmap returns page-aligned addresses (multiple of 4096).
-    // This is not perfectly reliable but works in practice for the
-    // non-moving heap. A production implementation would track the
-    // allocation method.
     if ((reinterpret_cast<uintptr_t>(base_) & 0xFFF) == 0) {
         ::munmap(base_, capacity_);
     } else {
@@ -54,16 +46,87 @@ Heap::~Heap() {
 }
 
 HeapRef Heap::alloc(size_t size_bytes) noexcept {
-    const size_t aligned = round_up(size_bytes, 8);
-    if (bump_ptr_ + aligned > end_) [[unlikely]] {
-        return NULL_HEAP_REF;  // out of memory
+    const size_t data_bytes = round_up(size_bytes, 8);
+    const uint32_t data_slots = static_cast<uint32_t>(data_bytes / 8);
+    const uint32_t total_slots = 1 + data_slots;  // 1 header + data
+
+    // First-fit search on the free list.
+    uint32_t prev_free = 0;
+    uint32_t cur = free_list_head_;
+    while (cur != 0) {
+        const uint32_t cur_raw = read_size_header(cur);
+        const uint32_t cur_total = cur_raw & ~FREE_FLAG;
+        const uint32_t cur_data = cur_total - 1;
+        if (cur_data >= data_slots) {
+            // Found a fit. If the block is much larger, split it.
+            if (cur_data >= data_slots + 2) {
+                // Split: keep the first `total_slots` for this alloc,
+                // create a new free block from the remainder.
+                const uint32_t remaining = cur_total - total_slots;
+                const uint32_t new_free_slot = cur + total_slots;
+                write_size_header(new_free_slot, remaining | FREE_FLAG);
+                const uint32_t next = read_free_next(cur + 1);
+                write_free_next(new_free_slot + 1, next);
+                if (prev_free == 0) {
+                    free_list_head_ = new_free_slot;
+                } else {
+                    write_free_next(prev_free + 1, new_free_slot);
+                }
+                // Clear the free flag for the reused block.
+                write_size_header(cur, total_slots);
+            } else {
+                // Use the whole block (no split). Clear the free flag.
+                const uint32_t next = read_free_next(cur + 1);
+                if (prev_free == 0) {
+                    free_list_head_ = next;
+                } else {
+                    write_free_next(prev_free + 1, next);
+                }
+                write_size_header(cur, cur_total);
+            }
+            // Zero the user data.
+            uint8_t* data = base_ + (cur + 1) * 8;
+            std::memset(data, 0, data_bytes);
+            allocated_bytes_ += data_bytes;
+            return HeapRef{cur + 1};
+        }
+        prev_free = cur;
+        cur = read_free_next(cur + 1);
     }
-    // Zero-initialize (Rule 86: GC references must be trackable; null
-    // is the safe default for freshly allocated memory).
-    std::memset(bump_ptr_, 0, aligned);
-    HeapRef ref = HeapRef::from_ptr(bump_ptr_, base());
-    bump_ptr_ += aligned;
-    return ref;
+
+    // No fit in free list; bump-allocate.
+    if (bump_ptr_ + static_cast<size_t>(total_slots) * 8 > end_) [[unlikely]] {
+        return NULL_HEAP_REF;
+    }
+    const uint32_t header_slot = static_cast<uint32_t>((bump_ptr_ - base_) / 8);
+    write_size_header(header_slot, total_slots);
+    bump_ptr_ += static_cast<size_t>(total_slots) * 8;
+    uint8_t* data = base_ + (header_slot + 1) * 8;
+    std::memset(data, 0, data_bytes);
+    allocated_bytes_ += data_bytes;
+    return HeapRef{header_slot + 1};
+}
+
+void Heap::free(HeapRef ref) noexcept {
+    if (ref.is_null()) return;
+    const uint32_t data_slot = ref.offset();
+    const uint32_t header_slot = data_slot - 1;
+    const uint32_t total_raw = read_size_header(header_slot);
+    const uint32_t total_slots = total_raw & ~FREE_FLAG;
+    const uint32_t data_slots = total_slots - 1;
+    allocated_bytes_ -= static_cast<size_t>(data_slots) * 8;
+    // Mark the block as free and add to the head of the free list.
+    write_size_header(header_slot, total_slots | FREE_FLAG);
+    write_free_next(data_slot, free_list_head_);
+    free_list_head_ = header_slot;
+}
+
+size_t Heap::object_size(HeapRef ref) const noexcept {
+    if (ref.is_null()) return 0;
+    const uint32_t header_slot = ref.offset() - 1;
+    if (header_slot >= static_cast<uint32_t>((bump_ptr_ - base_) / 8)) return 0;
+    const uint32_t total_slots = read_size_header(header_slot);
+    return static_cast<size_t>(total_slots - 1) * 8;
 }
 
 }  // namespace omni::gc

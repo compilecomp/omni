@@ -44,13 +44,15 @@ static void test_heap_ref_resolve() {
 
 static void test_heap_ref_alignment() {
     Heap heap(1024 * 1024);
-    HeapRef r1 = heap.alloc(7);  // request 7 bytes, get 8
+    HeapRef r1 = heap.alloc(7);  // request 7 bytes, get 8 (data) + 8 (header) = 16
     HeapRef r2 = heap.alloc(16);
     CHECK(!r1.is_null());
     CHECK(!r2.is_null());
-    // r2 should be 8 bytes after r1 (rounded up).
-    CHECK(r2.offset() == r1.offset() + 1);
-    // Allocated bytes should be 8 + 16 = 24.
+    // r1 = offset 2 (slot 0 = null, slot 1 = header, slot 2 = data)
+    // r2 = offset 4 (slot 3 = header, slot 4 = data)
+    // r2 should be 2 slots after r1 (1 header + 1 data for r1).
+    CHECK(r2.offset() == r1.offset() + 2);
+    // Allocated bytes: 8 (r1 data) + 16 (r2 data) = 24.
     CHECK(heap.allocated() == 24);
 }
 
@@ -65,7 +67,8 @@ static void test_heap_ref_zero_init() {
 }
 
 static void test_heap_ref_oom() {
-    Heap heap(64 + 8);  // tiny heap (64 usable + 8 reserved for null slot)
+    // Tiny heap: 8 (null) + 8 (header) + 64 (data) = 80 bytes minimum.
+    Heap heap(80);
     HeapRef r = heap.alloc(64);  // exactly fills usable space
     CHECK(!r.is_null());
     HeapRef r2 = heap.alloc(8);  // should fail
