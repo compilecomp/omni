@@ -52,6 +52,29 @@ Interpreter::Interpreter() {
     handlers_semantic::register_all(*this);
     handlers_quickened::register_all(*this);  // B11 fix
     handlers_fused::register_all(*this);      // B11 fix
+    register_with_gc();
+}
+
+void Interpreter::register_with_gc() {
+    // Register a root scanner that walks the current frame's registers.
+    // The GC calls this during the mark phase. We capture `this` because
+    // the interpreter is per-thread and the GC runs at a safepoint (the
+    // interpreter is stopped, so `this` is valid).
+    //
+    // NOTE: This root scanner is a placeholder. The current interpreter
+    // stores raw Object* pointers in registers, not HeapRefs. Once
+    // TaggedValue is migrated to store HeapRef (per the 32-bit OmniGC
+    // spec), this scanner will convert HeapRef -> mark(ref) directly.
+    // For now, the GC operates on its own heap (separate from the
+    // interpreter's raw-new objects). Full integration is a follow-up.
+    gc::GarbageCollector::instance().register_root_scanner(
+        [this](std::function<void(gc::HeapRef)> mark) {
+            if (current_frame_ == nullptr) return;
+            // Walk all registers. The gc_map tells us which registers
+            // hold object references (Rule 86). Once objects are
+            // GC-allocated, we'll resolve Object* -> HeapRef here.
+            (void)mark;  // placeholder — no GC-managed objects yet
+        });
 }
 
 Result<uint32_t> Interpreter::load_module(
@@ -105,11 +128,18 @@ Result<object_model::TaggedValue> Interpreter::execute(
     // calls (via CALL handler) work correctly.
     const bytecode::BytecodeModule* prev_module = current_module_;
     current_module_ = &module;
+    InterpFrame* prev_frame = current_frame_;
+    current_frame_ = &frame;
     struct CurrentModuleGuard {
         const bytecode::BytecodeModule*& slot;
         const bytecode::BytecodeModule* prev;
         ~CurrentModuleGuard() { slot = prev; }
     } module_guard{current_module_, prev_module};
+    struct CurrentFrameGuard {
+        InterpFrame*& slot;
+        InterpFrame* prev;
+        ~CurrentFrameGuard() { slot = prev; }
+    } frame_guard{current_frame_, prev_frame};
 
     // Load arguments into registers.
     for (uint16_t i = 0; i < fdesc.param_count; ++i) {
@@ -717,9 +747,16 @@ void Interpreter::handle_safepoint(InterpFrame& frame) noexcept {
             const_cast<bytecode::BytecodeModule&>(*current_module_), *this);
     }
 
-    // GC safepoint: in a full implementation we would check a global
-    // GC-state flag and yield if requested. For now, this is a no-op;
-    // the GC subsystem will be implemented in a later phase.
+    // GC safepoint: if the GC has requested a collection, run it now.
+    // The interpreter is at a safe point (no in-progress handler), so
+    // the GC can safely scan roots (Rule 88).
+    if (gc::GarbageCollector::instance().is_gc_requested()) [[unlikely]] {
+        gc::GarbageCollector::instance().clear_gc_request();
+        gc::GarbageCollector::instance().collect();
+    }
+
+    // GC safepoint: in a full implementation we would also check a global
+    // GC-state flag for STW pauses requested by the GC thread itself.
     // DESIGN.md §19 (GC model) is the spec for this.
 }
 

@@ -49,11 +49,14 @@
 #include "core/bytecode/bytecode_module.hpp"
 #include "core/common/result.hpp"
 #include "core/common/types.hpp"
+#include "core/gc/gc.hpp"
+#include "core/gc/gc_handle.hpp"
 #include "core/interpreter/dispatch.hpp"
 #include "core/interpreter/interp_frame.hpp"
 #include "core/object_model/tagged_value.hpp"
 
 #include <cstring>
+#include <functional>
 
 namespace omni::interpreter {
 
@@ -148,6 +151,17 @@ public:
     /// invalidations, and task suspension requests.
     void handle_safepoint(InterpFrame& frame) noexcept;
 
+    /// Register this interpreter's root scanner with the GC. Called
+    /// on construction. The scanner walks the interpreter's current
+    /// frame's registers and marks all object references as GC roots.
+    void register_with_gc();
+
+    /// The current frame (for GC root scanning). Set by execute() before
+    /// the dispatch loop begins. nullptr when not executing.
+    /// This is raw pointer (non-owning); the frame is stack-allocated
+    /// by execute(), so it's valid for the duration of the call.
+    [[nodiscard]] InterpFrame* current_frame() const noexcept { return current_frame_; }
+
 private:
     // Single unified dispatch table covering all 256 opcode values.
     // Semantic opcodes [0,127], quickened [128,223], fused [224,255]
@@ -168,6 +182,10 @@ private:
     /// before the dispatch loop begins; cleared on exit. Used by handlers
     /// to read the current instruction (B1 fix).
     const bytecode::BytecodeModule* current_module_{nullptr};
+
+    /// Pointer to the current frame (for GC root scanning). Set in
+    /// execute() before the dispatch loop begins; cleared on exit.
+    InterpFrame* current_frame_{nullptr};
 
     /// Atomic flag: when set, the interpreter checks for pending
     /// invalidations at the next safepoint. Cleared after the check.

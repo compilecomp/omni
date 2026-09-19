@@ -29,7 +29,8 @@ TEST_NAMES := \
 	tagged_value \
 	instruction \
 	speculative_arithmetic \
-	heap_ref
+	heap_ref \
+	gc
 
 TEST_BINS := $(patsubst %,$(BUILD_DIR)/test_%,$(TEST_NAMES))
 
@@ -50,7 +51,9 @@ CORE_SRCS := \
 	core/interpreter/handlers_semantic.cpp \
 	core/interpreter/interpreter.cpp \
 	core/interpreter/speculative_arithmetic.cpp \
-	core/gc/heap_ref.cpp
+	core/gc/heap_ref.cpp \
+	core/gc/gc_handle.cpp \
+	core/gc/gc.cpp
 
 .PHONY: all check clean
 
